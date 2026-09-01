@@ -90,4 +90,8 @@ class ExtractionBlocked(ExtractionError):
 
 
 class KnowledgeExtractor(Protocol):
+    name: str
+    model: str
+    prompt_version: int
+
     def extract(self, transcript: Path) -> list[StructuredRecord]: ...

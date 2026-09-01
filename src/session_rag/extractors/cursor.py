@@ -66,6 +66,8 @@ def _json_from_model_text(text: str) -> dict:
 
 
 class CursorExtractor:
+    name = "cursor"
+
     def __init__(
         self,
         executable: str = "cursor-agent",
@@ -104,6 +106,14 @@ class CursorExtractor:
         self._prompt_version = prompt_version or int(
             _configured(None, "SESSION_RAG_PROMPT_VERSION", str(DEFAULT_PROMPT_VERSION))
         )
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    @property
+    def prompt_version(self) -> int:
+        return self._prompt_version
 
     def extract(self, transcript: Path) -> list[StructuredRecord]:
         try:
