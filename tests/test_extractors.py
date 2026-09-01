@@ -4,7 +4,15 @@ from pathlib import Path
 
 import pytest
 from session_rag.extractors.cursor import CursorExtractor
-from session_rag.extractors.base import ExtractionBlocked, ExtractionError
+from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ProjectProvenance
+
+
+@pytest.fixture(autouse=True)
+def operator_id_env(monkeypatch):
+    monkeypatch.setenv("SESSION_RAG_OPERATOR_ID", "test-operator")
+    # Deterministic regardless of the host shell's own environment.
+    for var in ("SESSION_RAG_PROJECT_ID", "SESSION_RAG_PROJECT_ROOT", "SESSION_RAG_REPOSITORY_REVISION", "SESSION_RAG_WORKING_TREE_DIRTY"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def cursor_response(payload: dict) -> subprocess.CompletedProcess[str]:
@@ -39,7 +47,8 @@ def test_cursor_extractor_returns_validated_structured_records(tmp_path):
                         "resolution": "Increase the heartbeat interval.",
                         "systems": ["RabbitMQ"],
                         "code_references": ["RabbitConnectionManager"],
-                        "author": "Ian",
+                        "attribution": {"person": "Ian", "citation": "message-1"},
+                        "temporal_scope": "durable",
                         "timestamp": "2026-08-27T10:00:00Z",
                     }
                 ]
@@ -52,6 +61,11 @@ def test_cursor_extractor_returns_validated_structured_records(tmp_path):
     assert records[0].systems == ["RabbitMQ"]
     assert records[0].source == str(transcript.resolve())
     assert records[0].source_session_id == transcript.stem
+    assert records[0].attribution.person == "Ian"
+    assert records[0].temporal_scope == "durable"
+    assert records[0].source_type == "claude_session"
+    assert records[0].operator_id == "test-operator"
+    assert records[0].prompt_version == 1
     assert ["--mode", "ask"] == observed["command"][4:6]
     assert "--sandbox" in observed["command"]
     assert "--workspace" in observed["command"]
@@ -85,9 +99,33 @@ def test_cursor_extractor_does_not_trust_model_provenance(tmp_path):
                         "resolution": None,
                         "systems": [],
                         "code_references": [],
-                        "author": None,
                         "timestamp": None,
                         "source": "/forged/path",
+                    }
+                ]
+            }
+        )
+
+    with pytest.raises(ExtractionError):
+        CursorExtractor(runner=runner).extract(transcript)
+
+
+def test_cursor_extractor_rejects_forged_trusted_provenance(tmp_path):
+    transcript = tmp_path / "real-session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response(
+            {
+                "records": [
+                    {
+                        "question": "What happened?",
+                        "summary": "A reconnect occurred.",
+                        "resolution": None,
+                        "systems": [],
+                        "code_references": [],
+                        "timestamp": None,
+                        "operator_id": "forged-operator",
                     }
                 ]
             }
@@ -194,7 +232,57 @@ def test_cursor_extractor_honors_configured_sensitive_paths(tmp_path):
     assert "/Users/ian/secret-project/creds.txt" not in observed["input"]
 
 
-def test_cursor_extractor_never_credits_a_non_person_author(tmp_path):
+def test_cursor_extractor_rejects_forged_project_id(tmp_path):
+    transcript = tmp_path / "real-session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response(
+            {
+                "records": [
+                    {
+                        "question": "What happened?",
+                        "summary": "A reconnect occurred.",
+                        "resolution": None,
+                        "systems": [],
+                        "code_references": [],
+                        "timestamp": None,
+                        "project_id": "forged-project",
+                    }
+                ]
+            }
+        )
+
+    with pytest.raises(ExtractionError):
+        CursorExtractor(runner=runner).extract(transcript)
+
+
+def test_cursor_extractor_rejects_attribution_masquerading_as_trusted(tmp_path):
+    transcript = tmp_path / "real-session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response(
+            {
+                "records": [
+                    {
+                        "question": "What happened?",
+                        "summary": "A reconnect occurred.",
+                        "resolution": None,
+                        "systems": [],
+                        "code_references": [],
+                        "timestamp": None,
+                        "attribution": {"person": "Ian", "citation": "message-1", "trusted": True},
+                    }
+                ]
+            }
+        )
+
+    with pytest.raises(ExtractionError):
+        CursorExtractor(runner=runner).extract(transcript)
+
+
+def test_cursor_extractor_never_credits_a_non_person_attribution(tmp_path):
     transcript = tmp_path / "session.jsonl"
     write_transcript(transcript)
 
@@ -208,7 +296,7 @@ def test_cursor_extractor_never_credits_a_non_person_author(tmp_path):
                         "resolution": None,
                         "systems": [],
                         "code_references": [],
-                        "author": "Subagent",
+                        "attribution": {"person": "Subagent", "citation": "message-2"},
                         "timestamp": None,
                     }
                 ]
@@ -217,10 +305,10 @@ def test_cursor_extractor_never_credits_a_non_person_author(tmp_path):
 
     records = CursorExtractor(runner=runner).extract(transcript)
 
-    assert records[0].author is None
+    assert records[0].attribution is None
 
 
-def test_cursor_extractor_preserves_a_real_person_author(tmp_path):
+def test_cursor_extractor_preserves_a_real_person_attribution(tmp_path):
     transcript = tmp_path / "session.jsonl"
     write_transcript(transcript)
 
@@ -234,7 +322,7 @@ def test_cursor_extractor_preserves_a_real_person_author(tmp_path):
                         "resolution": None,
                         "systems": [],
                         "code_references": [],
-                        "author": "Ian",
+                        "attribution": {"person": "Ian", "citation": "message-2"},
                         "timestamp": None,
                     }
                 ]
@@ -243,7 +331,70 @@ def test_cursor_extractor_preserves_a_real_person_author(tmp_path):
 
     records = CursorExtractor(runner=runner).extract(transcript)
 
-    assert records[0].author == "Ian"
+    assert records[0].attribution.person == "Ian"
+    assert records[0].attribution.citation == "message-2"
+
+
+def test_cursor_extractor_requires_operator_id_configured(tmp_path, monkeypatch):
+    monkeypatch.delenv("SESSION_RAG_OPERATOR_ID", raising=False)
+
+    with pytest.raises(ValueError, match="operator_id"):
+        CursorExtractor(runner=lambda *a, **k: None)
+
+
+def test_cursor_extractor_attaches_project_provenance_without_sending_project_root(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+    observed: dict = {}
+
+    def runner(command, **kwargs):
+        observed["input"] = kwargs["input"]
+        return cursor_response({"records": [{"question": "Q", "summary": "S"}]})
+
+    project = ProjectProvenance(
+        project_id="session-rag",
+        project_root="/Users/ian/src/session-rag",
+        repository_revision="abc123",
+        working_tree_dirty=True,
+    )
+    records = CursorExtractor(runner=runner, project=project).extract(transcript)
+
+    assert records[0].project.project_id == "session-rag"
+    assert records[0].project.project_root == "/Users/ian/src/session-rag"
+    assert records[0].project.repository_revision == "abc123"
+    assert records[0].project.working_tree_dirty is True
+    assert "/Users/ian/src/session-rag" not in observed["input"]
+
+
+def test_cursor_extractor_leaves_project_none_without_configured_project(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S"}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert records[0].project is None
+
+
+def test_cursor_extractor_reads_project_provenance_from_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSION_RAG_PROJECT_ID", "session-rag")
+    monkeypatch.setenv("SESSION_RAG_REPOSITORY_REVISION", "def456")
+    monkeypatch.setenv("SESSION_RAG_WORKING_TREE_DIRTY", "true")
+    monkeypatch.delenv("SESSION_RAG_PROJECT_ROOT", raising=False)
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S"}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert records[0].project.project_id == "session-rag"
+    assert records[0].project.repository_revision == "def456"
+    assert records[0].project.working_tree_dirty is True
+    assert records[0].project.project_root is None
 
 
 def test_cursor_extractor_blocks_oversized_sanitized_session(tmp_path):

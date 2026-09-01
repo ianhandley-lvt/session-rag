@@ -39,13 +39,16 @@ def run(arguments: list[str] | None = None, embedder: Embedder | None = None) ->
         count = index_memories(args.database, load_sessions(args.directory), selected_embedder)
         print(f"Indexed {count} session memories in {args.database}")
     elif args.command == "extract-session":
-        extractor = create_extractor(
-            args.extractor,
-            cursor_mode=args.cursor_mode,
-            cursor_model=args.cursor_model,
-        )
         try:
+            extractor = create_extractor(
+                args.extractor,
+                cursor_mode=args.cursor_mode,
+                cursor_model=args.cursor_model,
+            )
             records = extractor.extract(args.transcript)
+        except ValueError as error:
+            print(f"configuration error: {error}", file=sys.stderr)
+            return 3
         except ExtractionBlocked as error:
             # Distinct from a failed attempt: the input was rejected before extraction ran.
             # Full pending_retry/failed/blocked job-status persistence is ticket #5's job —

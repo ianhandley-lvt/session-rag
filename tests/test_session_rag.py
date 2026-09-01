@@ -82,11 +82,23 @@ def test_cli_extract_session_reports_blocked_for_oversized_session(tmp_path, cap
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(json.dumps({"type": "user", "message": {"content": "a" * 1000}}) + "\n")
     monkeypatch.setenv("SESSION_RAG_MAX_SANITIZED_CHARS", "50")
+    monkeypatch.setenv("SESSION_RAG_OPERATOR_ID", "test-operator")
 
     exit_code = run(["extract-session", str(transcript)])
 
     assert exit_code == 2
     assert "blocked:" in capsys.readouterr().err
+
+
+def test_cli_extract_session_reports_configuration_error_without_operator_id(tmp_path, capsys, monkeypatch):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+    monkeypatch.delenv("SESSION_RAG_OPERATOR_ID", raising=False)
+
+    exit_code = run(["extract-session", str(transcript)])
+
+    assert exit_code == 3
+    assert "configuration error" in capsys.readouterr().err
 
 
 def test_hook_fails_open_when_database_does_not_exist(tmp_path):
