@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from session_rag.extractors.cursor import CursorExtractor
-from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ProjectProvenance
+from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry, ProjectProvenance
 
 
 @pytest.fixture(autouse=True)
@@ -72,6 +72,88 @@ def test_cursor_extractor_returns_validated_structured_records(tmp_path):
     assert "--trust" in observed["command"]
     assert "Why did RabbitMQ reconnect?" in observed["input"]
     assert str(transcript) not in observed["input"]
+
+
+def test_cursor_extractor_raises_pending_retry_on_timeout(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="cursor-agent", timeout=120)
+
+    with pytest.raises(ExtractionPendingRetry):
+        CursorExtractor(runner=runner).extract(transcript)
+
+
+def test_cursor_extractor_raises_pending_retry_on_nonzero_exit(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        raise subprocess.CalledProcessError(returncode=1, cmd="cursor-agent")
+
+    with pytest.raises(ExtractionPendingRetry):
+        CursorExtractor(runner=runner).extract(transcript)
+
+
+def test_cursor_extractor_raises_pending_retry_when_cursor_unavailable(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        raise FileNotFoundError("cursor-agent not found")
+
+    with pytest.raises(ExtractionPendingRetry):
+        CursorExtractor(runner=runner).extract(transcript)
+
+
+def test_cursor_extractor_raises_failed_on_reported_non_success_envelope(tmp_path):
+    # A non-success envelope isn't assumed to be infra-level (no evidence for
+    # what subtypes Cursor reports for a bad request vs. real unavailability)
+    # — it's retried like malformed output, then lands in `failed`, not
+    # `pending_retry`. Only genuine subprocess-level failures are pending_retry.
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        envelope = {"type": "result", "subtype": "error", "result": "quota exceeded"}
+        return subprocess.CompletedProcess([], 0, stdout=json.dumps(envelope), stderr="")
+
+    with pytest.raises(ExtractionError) as excinfo:
+        CursorExtractor(runner=runner, max_output_retries=0).extract(transcript)
+
+    assert not isinstance(excinfo.value, ExtractionPendingRetry)
+
+
+def test_cursor_extractor_retries_invalid_output_before_failing(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+    calls = {"count": 0}
+
+    def runner(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return subprocess.CompletedProcess([], 0, stdout="not json", stderr="")
+        return cursor_response({"records": [{"question": "Q", "summary": "S"}]})
+
+    records = CursorExtractor(runner=runner, max_output_retries=1).extract(transcript)
+
+    assert calls["count"] == 2
+    assert records[0].question == "Q"
+
+
+def test_cursor_extractor_raises_failed_after_exhausting_retries(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return subprocess.CompletedProcess([], 0, stdout="not json", stderr="")
+
+    with pytest.raises(ExtractionError) as excinfo:
+        CursorExtractor(runner=runner, max_output_retries=1).extract(transcript)
+
+    assert not isinstance(excinfo.value, ExtractionPendingRetry)
+    assert not isinstance(excinfo.value, ExtractionBlocked)
 
 
 def test_cursor_extractor_rejects_records_outside_the_schema(tmp_path):

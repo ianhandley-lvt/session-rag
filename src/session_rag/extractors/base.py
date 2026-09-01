@@ -89,6 +89,17 @@ class ExtractionBlocked(ExtractionError):
         super().__init__(reason)
 
 
+class ExtractionPendingRetry(ExtractionError):
+    """Cursor was unavailable, timed out, or reported non-success (e.g. quota
+    exhaustion) — an infra-level condition, retryable later without penalty.
+    Distinct from a plain ExtractionError, which means the model's own output
+    was invalid."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class KnowledgeExtractor(Protocol):
     name: str
     model: str

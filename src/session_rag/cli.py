@@ -5,11 +5,11 @@ import json
 import sys
 from pathlib import Path
 
-from .artifacts import artifact_path, source_hash, write_artifact
 from .embeddings import FastEmbedder
 from .extractors import create_extractor
-from .extractors.base import ExtractionBlocked, ExtractionError, KnowledgeExtractor
+from .extractors.base import KnowledgeExtractor
 from .hook import format_context, handle_user_prompt
+from .pipeline import run_extraction
 from .store import Embedder, index_memories, search_memories
 from .transcripts import load_sessions
 
@@ -45,58 +45,41 @@ def run(
         count = index_memories(args.database, load_sessions(args.directory), selected_embedder)
         print(f"Indexed {count} session memories in {args.database}")
     elif args.command == "extract-session":
-        hash_value = source_hash(args.transcript)
-        existing_path = artifact_path(
-            args.artifacts, source_type="claude_session", source_id=args.transcript.stem, hash_value=hash_value
-        )
-        if existing_path.exists():
-            # Artifacts are immutable and re-extraction can't safely change one (see
-            # write_artifact) — so an unchanged source hash skips extraction entirely
-            # rather than paying for it only to discard the result.
-            envelope = json.loads(existing_path.read_text())
-            print(
-                json.dumps(
-                    {"artifact_path": str(existing_path), "records": envelope["episode_records"]},
-                    indent=2,
-                )
-            )
-            return 0
         try:
             selected_extractor = extractor or create_extractor(
                 args.extractor,
                 cursor_mode=args.cursor_mode,
                 cursor_model=args.cursor_model,
             )
-            records = selected_extractor.extract(args.transcript)
         except ValueError as error:
             print(f"configuration error: {error}", file=sys.stderr)
             return 3
-        except ExtractionBlocked as error:
-            # Distinct from a failed attempt: the input was rejected before extraction ran.
-            # Full pending_retry/failed/blocked job-status persistence is ticket #5's job —
-            # this is the minimal CLI-surface signal this ticket's acceptance criteria need.
-            print(f"blocked: {error.reason}", file=sys.stderr)
+
+        outcome = run_extraction(selected_extractor, args.transcript, args.artifacts)
+
+        if outcome.status == "blocked":
+            print(f"blocked: {outcome.reason}", file=sys.stderr)
             return 2
-        except ExtractionError as error:
-            print(f"failed: {error}", file=sys.stderr)
+        if outcome.status == "pending_retry":
+            print(f"pending_retry: {outcome.reason}", file=sys.stderr)
+            return 4
+        if outcome.status == "failed":
+            print(f"failed: {outcome.reason}", file=sys.stderr)
             return 1
-        written_path = write_artifact(
-            args.artifacts,
-            source_type="claude_session",
-            source_id=args.transcript.stem,
-            source_uri=str(args.transcript.resolve()),
-            hash_value=hash_value,
-            extractor=selected_extractor.name,
-            extractor_model=selected_extractor.model,
-            prompt_version=selected_extractor.prompt_version,
-            episode_records=records,
-        )
+
+        if outcome.orphaned_questions:
+            print(
+                f"note: {len(outcome.orphaned_questions)} record(s) from the previous revision have no "
+                "obvious counterpart in this extraction — review for verification, rejection, or supersession:",
+                file=sys.stderr,
+            )
+            for question in outcome.orphaned_questions:
+                print(f"  - {question}", file=sys.stderr)
+
+        envelope = json.loads(outcome.artifact_path.read_text())
         print(
             json.dumps(
-                {
-                    "artifact_path": str(written_path),
-                    "records": [record.model_dump(mode="json") for record in records],
-                },
+                {"artifact_path": str(outcome.artifact_path), "records": envelope["episode_records"]},
                 indent=2,
             )
         )

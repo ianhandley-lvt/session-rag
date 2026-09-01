@@ -1,7 +1,16 @@
 import json
 from pathlib import Path
 
-from session_rag.artifacts import artifact_path, source_hash, write_artifact
+from session_rag.artifacts import (
+    artifact_path,
+    clear_job_status,
+    job_status_path,
+    read_active_hash,
+    set_active_hash,
+    source_hash,
+    write_artifact,
+    write_job_status,
+)
 
 from conftest import make_record
 
@@ -147,3 +156,45 @@ def test_write_artifact_path_computed_correctly():
     )
 
     assert path == Path("/root/claude_session/session-123/sha256-abc.json")
+
+
+def test_read_active_hash_is_none_when_never_set(tmp_path):
+    assert read_active_hash(tmp_path, source_type="claude_session", source_id="session-123") is None
+
+
+def test_set_and_read_active_hash_roundtrip(tmp_path):
+    set_active_hash(tmp_path, source_type="claude_session", source_id="session-123", hash_value="sha256:abc")
+
+    assert read_active_hash(tmp_path, source_type="claude_session", source_id="session-123") == "sha256:abc"
+
+
+def test_set_active_hash_overwrites_previous_value(tmp_path):
+    set_active_hash(tmp_path, source_type="claude_session", source_id="session-123", hash_value="sha256:abc")
+    set_active_hash(tmp_path, source_type="claude_session", source_id="session-123", hash_value="sha256:def")
+
+    assert read_active_hash(tmp_path, source_type="claude_session", source_id="session-123") == "sha256:def"
+
+
+def test_write_and_clear_job_status(tmp_path):
+    write_job_status(
+        tmp_path,
+        source_type="claude_session",
+        source_id="session-123",
+        status="failed",
+        reason="invalid JSON",
+        attempted_hash="sha256:abc",
+    )
+    path = job_status_path(tmp_path, source_type="claude_session", source_id="session-123")
+    status = json.loads(path.read_text())
+
+    assert status["status"] == "failed"
+    assert status["reason"] == "invalid JSON"
+    assert status["attempted_hash"] == "sha256:abc"
+    assert "attempted_at" in status
+
+    clear_job_status(tmp_path, source_type="claude_session", source_id="session-123")
+    assert not path.exists()
+
+
+def test_clear_job_status_is_safe_when_nothing_to_clear(tmp_path):
+    clear_job_status(tmp_path, source_type="claude_session", source_id="session-123")

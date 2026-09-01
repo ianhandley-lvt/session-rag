@@ -9,8 +9,10 @@ from pathlib import Path
 
 from .base import (
     Attribution,
+    ExtractedKnowledge,
     ExtractionBlocked,
     ExtractionError,
+    ExtractionPendingRetry,
     ExtractionResult,
     ProjectProvenance,
     StructuredRecord,
@@ -22,6 +24,7 @@ Runner = Callable[..., subprocess.CompletedProcess[str]]
 
 NON_PERSON_IDENTIFIERS = {"subagent", "tool"}
 DEFAULT_PROMPT_VERSION = 1
+DEFAULT_MAX_OUTPUT_RETRIES = 1
 
 
 def _configured(value: str | None, env_var: str, default: str) -> str:
@@ -80,6 +83,7 @@ class CursorExtractor:
         operator_id: str | None = None,
         project: ProjectProvenance | None = None,
         prompt_version: int | None = None,
+        max_output_retries: int | None = None,
     ) -> None:
         self._executable = executable
         self._runner = runner
@@ -105,6 +109,9 @@ class CursorExtractor:
         self._project = project if project is not None else _project_from_environment()
         self._prompt_version = prompt_version or int(
             _configured(None, "SESSION_RAG_PROMPT_VERSION", str(DEFAULT_PROMPT_VERSION))
+        )
+        self._max_output_retries = max_output_retries or int(
+            _configured(None, "SESSION_RAG_MAX_OUTPUT_RETRIES", str(DEFAULT_MAX_OUTPUT_RETRIES))
         )
 
     @property
@@ -140,26 +147,7 @@ class CursorExtractor:
             str(self._workspace),
             "--trust",
         ]
-        try:
-            completed = self._runner(
-                command,
-                input=prompt,
-                text=True,
-                capture_output=True,
-                check=True,
-                timeout=120,
-            )
-            envelope = json.loads(completed.stdout)
-            if not isinstance(envelope, dict):
-                raise ValueError("Cursor envelope must be an object")
-            if envelope.get("type") != "result" or envelope.get("subtype") != "success":
-                raise ValueError("Cursor did not return a successful result")
-            result_text = envelope.get("result")
-            if not isinstance(result_text, str):
-                raise ValueError("Cursor result must be text")
-            drafts = ExtractionResult.model_validate(_json_from_model_text(result_text)).records
-        except Exception as error:
-            raise ExtractionError(f"Cursor extraction failed: {type(error).__name__}") from error
+        drafts = self._run_with_retries(command, prompt)
         return [
             StructuredRecord(
                 **{**draft.model_dump(), "attribution": _person_attribution(draft.attribution)},
@@ -173,6 +161,47 @@ class CursorExtractor:
             )
             for draft in drafts
         ]
+
+    def _run_with_retries(self, command: list[str], prompt: str) -> list[ExtractedKnowledge]:
+        """Call Cursor and parse its response, retrying only invalid output a
+        bounded number of times. Only genuine subprocess-level infra failures
+        (timeout, nonzero exit, Cursor binary unavailable) raise
+        ExtractionPendingRetry immediately, without in-process retry — that's
+        a distinct, externally-retried job status. A non-success envelope is
+        NOT assumed to be infra-level (we have no evidence for what subtypes
+        Cursor actually reports for a bad request vs. real unavailability),
+        so it's treated the same as malformed output: retried, then failed."""
+
+        last_error: Exception | None = None
+        for _ in range(self._max_output_retries + 1):
+            try:
+                completed = self._runner(
+                    command,
+                    input=prompt,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                    timeout=120,
+                )
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
+                raise ExtractionPendingRetry(f"Cursor unavailable: {type(error).__name__}: {error}") from error
+
+            try:
+                envelope = json.loads(completed.stdout)
+                if not isinstance(envelope, dict):
+                    raise ValueError("Cursor envelope must be an object")
+                if envelope.get("type") != "result" or envelope.get("subtype") != "success":
+                    raise ValueError(f"Cursor did not return a successful result: {envelope.get('subtype')!r}")
+                result_text = envelope.get("result")
+                if not isinstance(result_text, str):
+                    raise ValueError("Cursor result must be text")
+                return ExtractionResult.model_validate(_json_from_model_text(result_text)).records
+            except Exception as error:
+                last_error = error
+        raise ExtractionError(
+            f"Cursor returned invalid output after {self._max_output_retries + 1} attempt(s): "
+            f"{type(last_error).__name__}"
+        ) from last_error
 
     @staticmethod
     def _prompt(content: str) -> str:
