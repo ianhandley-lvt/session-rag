@@ -50,5 +50,13 @@ class ExtractionError(RuntimeError):
     """A provider failed to return valid structured knowledge."""
 
 
+class ExtractionBlocked(ExtractionError):
+    """Input was rejected before an extraction attempt was made (e.g. oversized after sanitization)."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
 class KnowledgeExtractor(Protocol):
     def extract(self, transcript: Path) -> list[StructuredRecord]: ...

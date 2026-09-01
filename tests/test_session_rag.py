@@ -78,6 +78,17 @@ def test_user_prompt_hook_returns_additional_context(tmp_path):
     assert "session-123.jsonl" in context
 
 
+def test_cli_extract_session_reports_blocked_for_oversized_session(tmp_path, capsys, monkeypatch):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": "a" * 1000}}) + "\n")
+    monkeypatch.setenv("SESSION_RAG_MAX_SANITIZED_CHARS", "50")
+
+    exit_code = run(["extract-session", str(transcript)])
+
+    assert exit_code == 2
+    assert "blocked:" in capsys.readouterr().err
+
+
 def test_hook_fails_open_when_database_does_not_exist(tmp_path):
     response = handle_user_prompt(
         {"hook_event_name": "UserPromptSubmit", "prompt": "Anything"},

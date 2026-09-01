@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .embeddings import FastEmbedder
 from .extractors import create_extractor
+from .extractors.base import ExtractionBlocked, ExtractionError
 from .hook import format_context, handle_user_prompt
 from .store import Embedder, index_memories, search_memories
 from .transcripts import load_sessions
@@ -43,7 +44,17 @@ def run(arguments: list[str] | None = None, embedder: Embedder | None = None) ->
             cursor_mode=args.cursor_mode,
             cursor_model=args.cursor_model,
         )
-        records = extractor.extract(args.transcript)
+        try:
+            records = extractor.extract(args.transcript)
+        except ExtractionBlocked as error:
+            # Distinct from a failed attempt: the input was rejected before extraction ran.
+            # Full pending_retry/failed/blocked job-status persistence is ticket #5's job —
+            # this is the minimal CLI-surface signal this ticket's acceptance criteria need.
+            print(f"blocked: {error.reason}", file=sys.stderr)
+            return 2
+        except ExtractionError as error:
+            print(f"failed: {error}", file=sys.stderr)
+            return 1
         print(json.dumps({"records": [record.model_dump(mode="json") for record in records]}, indent=2))
     elif args.command == "search":
         selected_embedder = embedder or FastEmbedder()
