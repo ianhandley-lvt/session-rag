@@ -511,3 +511,106 @@ def test_explicit_cursor_configuration_overrides_environment(tmp_path, monkeypat
 
     assert observed["command"][4:6] == ["--mode", "ask"]
     assert ["--model", "gemini-3.7-flash-low"] == observed["command"][6:8]
+
+
+def test_cursor_extractor_no_longer_sets_authority(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S"}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert "authority" not in records[0].model_dump()
+
+
+def test_cursor_extractor_accepts_evidence_location_matching_a_real_entry(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)  # sanitizes to exactly one entry, identifier "line-0"
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S", "evidence_location": "line-0"}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert records[0].evidence_location.identifier == "line-0"
+    assert records[0].evidence_location.preserved_text == "User: Why did RabbitMQ reconnect?"
+
+
+def test_cursor_extractor_rejects_unknown_evidence_location_identifier(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)  # only "line-0" exists
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S", "evidence_location": "line-5"}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert records[0].evidence_location is None
+
+
+def test_cursor_extractor_rejects_an_entirely_invented_identifier(tmp_path):
+    # Not even shaped like a real fallback identifier — proves rejection is a
+    # genuine membership check against the sanitizer's own entries, not a
+    # pattern/range check that a plausible-looking guess could satisfy.
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S", "evidence_location": "made-up-turn-99"}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert records[0].evidence_location is None
+
+
+def test_cursor_extractor_multiline_record_resolves_to_the_full_multiline_evidence(tmp_path):
+    # One raw record with several content blocks renders as text containing
+    # embedded newlines — it must still be exactly one selectable identifier,
+    # whose preserved_text carries the whole multiline entry, not just
+    # whatever a naive per-rendered-line scheme would have picked up.
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Checked the logs."},
+                        {"type": "text", "text": "Found a heartbeat timeout."},
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S", "evidence_location": "line-0"}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    location = records[0].evidence_location
+    assert location.identifier == "line-0"
+    assert "Checked the logs." in location.preserved_text
+    assert "Found a heartbeat timeout." in location.preserved_text
+
+
+def test_evidence_location_preserved_text_survives_transcript_mutation(tmp_path):
+    # A citation must remain resolvable after the original transcript
+    # changes — preserved_text is a snapshot captured at extraction time,
+    # never re-derived by re-reading the live file.
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S", "evidence_location": "line-0"}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+    original_preserved_text = records[0].evidence_location.preserved_text
+
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": "totally different content"}}) + "\n")
+
+    assert records[0].evidence_location.preserved_text == original_preserved_text
+    assert "totally different content" not in original_preserved_text

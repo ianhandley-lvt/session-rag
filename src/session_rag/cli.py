@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from .artifacts import find_record, forget_source, load_active_episode_records
+from .artifacts import find_record, find_sources_by_project, forget_source, load_active_episode_records
 from .embeddings import FastEmbedder
 from .extractors import create_extractor
 from .extractors.base import KnowledgeExtractor
@@ -75,10 +75,34 @@ def parser() -> argparse.ArgumentParser:
     supersede_cmd.add_argument("replacement_id")
     _add_record_command_args(commands.add_parser("history"))
     forget_cmd = commands.add_parser("forget")
-    forget_cmd.add_argument("source_id")
+    forget_cmd.add_argument("source_id", nargs="?")
+    forget_cmd.add_argument("--project")
     forget_cmd.add_argument("--artifacts", type=Path, required=True)
     forget_cmd.add_argument("--database", type=Path, required=True)
     return result
+
+
+def _forget_sources(artifacts_root: Path, database: Path, source_ids: list[str], *, project_id: str | None = None) -> int:
+    """Run the full forget sequence (artifact, overlay, trace, index) for
+    each source — shared by single-source and project-wide forget so the
+    erasure guarantee is enforced identically either way.
+
+    LanceDB only ever holds rows from a source's *active* revision, so its
+    rows are purged only when this source's active revision was actually
+    removed — never unconditionally by source_id alone. Otherwise, for a
+    source whose revision history spans more than one project, forgetting
+    one project could hard-delete another project's still-active, currently
+    indexed rows for that same source_id — an isolation violation."""
+
+    total = 0
+    for source_id in source_ids:
+        record_ids, active_revision_removed = forget_source(artifacts_root, source_id, project_id=project_id)
+        forget_records(artifacts_root, record_ids)
+        purge_traces(artifacts_root, set(record_ids))
+        if project_id is None or active_revision_removed:
+            delete_by_source_id(database, source_id)
+        total += len(record_ids)
+    return total
 
 
 def run(
@@ -138,11 +162,24 @@ def run(
         )
         print(format_context(results) if results else "No relevant session memory found.")
     elif args.command == "hook":
-        selected_embedder = embedder or FastEmbedder()
+        # Construction is deferred to inside handle_user_prompt's timed
+        # daemon thread (embedder_factory) rather than built eagerly here —
+        # otherwise model init/process startup would fall outside
+        # retrieval_timeout_ms, defeating the fail-open guarantee. A
+        # caller-supplied embedder (e.g. tests) bypasses the factory and is
+        # used directly.
         scope = _scope_from_args(args)
         try:
             event = json.load(sys.stdin)
-            print(json.dumps(handle_user_prompt(event, args.database, args.artifacts, selected_embedder, scope=scope)))
+            result = handle_user_prompt(
+                event,
+                args.database,
+                args.artifacts,
+                embedder=embedder,
+                embedder_factory=None if embedder else FastEmbedder,
+                scope=scope,
+            )
+            print(json.dumps(result))
         except Exception:
             print("{}")
     elif args.command in {"verify", "reject", "supersede", "history"}:
@@ -169,13 +206,21 @@ def run(
             return 1
         print(f"{verb} {args.record_id}")
     elif args.command == "forget":
-        record_ids = forget_source(args.artifacts, args.source_id)
-        forget_records(args.artifacts, record_ids)
-        purge_traces(args.artifacts, set(record_ids))
-        delete_by_source_id(args.database, args.source_id)
+        if bool(args.source_id) == bool(args.project):
+            print("forget requires exactly one of <source-id> or --project", file=sys.stderr)
+            return 1
+        if args.source_id:
+            source_ids = [args.source_id]
+            label = f"source {args.source_id}"
+            project_id = None
+        else:
+            source_ids = find_sources_by_project(args.artifacts, args.project)
+            label = f"project {args.project}"
+            project_id = args.project
+        total_records = _forget_sources(args.artifacts, args.database, source_ids, project_id=project_id)
         # Terminal-only, one-time — never written to a file, matching the
         # erasure guarantee (no record of the deletion itself is retained).
-        print(f"forgot {len(record_ids)} record(s) for source {args.source_id}")
+        print(f"forgot {total_records} record(s) across {len(source_ids)} source(s) for {label}")
     return 0
 
 

@@ -112,11 +112,24 @@ def job_status_path(root: Path, *, source_type: SourceType, source_id: str) -> P
 
 
 def write_job_status(
-    root: Path, *, source_type: SourceType, source_id: str, status: JobStatus, reason: str, attempted_hash: str
+    root: Path,
+    *,
+    source_type: SourceType,
+    source_id: str,
+    status: JobStatus,
+    reason: str,
+    attempted_hash: str,
+    project_id: str | None = None,
 ) -> None:
     """Non-sensitive metadata identifying which source revision needs a
     retry — no transcript content, no secrets. Retained until the next
-    successful extraction of this source clears it."""
+    successful extraction of this source clears it.
+
+    `project_id` records which project (if any) the attempt was configured
+    for — the only way a later project-scoped forget can tell whether this
+    status belongs to the project being erased. A failed/blocked/
+    pending_retry attempt never produces an Episode Record, so it never
+    gets Project Provenance any other way."""
 
     path = job_status_path(root, source_type=source_type, source_id=source_id)
     atomic_write_json(
@@ -126,6 +139,7 @@ def write_job_status(
             "reason": reason,
             "attempted_hash": attempted_hash,
             "attempted_at": datetime.now(timezone.utc).isoformat(),
+            "project_id": project_id,
         },
     )
 
@@ -197,17 +211,93 @@ def find_record(root: Path, record_id: str) -> dict | None:
     return None
 
 
-def forget_source(root: Path, source_id: str) -> list[str]:
-    """Hard-delete every artifact revision (all hashes, active pointer, job
-    status) for one source, across whichever source_type it lives under.
-    Returns the record ids that existed, so callers can also purge Record
-    State Overlay entries — forget must leave no trace anywhere."""
+def _record_project_id(record: dict) -> str | None:
+    """A record's Project Provenance project_id, or None — the one place
+    that shape is read, shared by find_sources_by_project and
+    forget_source so both apply the exact same matching rule."""
+
+    return (record.get("project") or {}).get("project_id")
+
+
+def find_sources_by_project(root: Path, project_id: str) -> list[str]:
+    """Every source_id with a trace of project_id: at least one Episode
+    Record (in any revision) whose Project Provenance matches, OR — with no
+    successful revision at all — an Extraction Job Status attempted under
+    project_id. A failed/blocked/pending_retry attempt never produces an
+    Episode Record, so job status is the only place its project attribution
+    can live; without checking it here, a source whose only trace of a
+    project is a failed attempt would be invisible to project-wide forget,
+    leaving that attempt's hash/reason/metadata behind forever. Used by
+    project-wide forget to discover which sources to erase."""
+
+    matches: list[str] = []
+    for source_type, source_dir in _iter_source_dirs(root):
+        has_matching_record = any(
+            _record_project_id(record) == project_id
+            for envelope in _iter_source_envelopes(source_dir)
+            for record in envelope["episode_records"]
+        )
+        if has_matching_record:
+            matches.append(source_dir.name)
+            continue
+        job_path = job_status_path(root, source_type=source_type, source_id=source_dir.name)
+        if job_path.exists() and read_json(job_path).get("project_id") == project_id:
+            matches.append(source_dir.name)
+    return matches
+
+
+def forget_source(root: Path, source_id: str, *, project_id: str | None = None) -> tuple[list[str], bool]:
+    """Hard-delete artifact revisions for one source, across whichever
+    source_type it lives under. Returns (record_ids, active_revision_removed)
+    — record_ids so callers can also purge Record State Overlay and
+    Retrieval Trace entries, active_revision_removed so callers know whether
+    the source's indexed LanceDB rows are now stale and must be purged too.
+
+    With project_id=None (single-source forget), every revision is deleted
+    unconditionally — forget must leave no trace anywhere. With project_id
+    set (project-wide forget), only revisions whose records carry that
+    Project Provenance are deleted: a source_id's revision history can in
+    principle span more than one project (e.g. the same session transcript
+    re-extracted after the operator's project config changed), and
+    forgetting one project must never delete another project's still-active
+    revision for that source — isolation must hold even in that edge case.
+    """
 
     record_ids: list[str] = []
-    for _, source_dir in _iter_source_dirs(root):
+    active_revision_removed = False
+    for source_type, source_dir in _iter_source_dirs(root):
         if source_dir.name != source_id:
             continue
-        for envelope in _iter_source_envelopes(source_dir):
-            record_ids.extend(record["id"] for record in envelope["episode_records"])
-        shutil.rmtree(source_dir)
-    return record_ids
+
+        active_hash = read_active_hash(root, source_type=source_type, source_id=source_id)
+        remaining_hashes: list[str] = []
+        for artifact_file in sorted(source_dir.glob("sha256-*.json")):
+            envelope = read_artifact(artifact_file)
+            matches = project_id is None or any(
+                _record_project_id(record) == project_id for record in envelope["episode_records"]
+            )
+            if matches:
+                record_ids.extend(record["id"] for record in envelope["episode_records"])
+                artifact_file.unlink()
+                if envelope["source_hash"] == active_hash:
+                    active_revision_removed = True
+            else:
+                remaining_hashes.append(envelope["source_hash"])
+
+        if remaining_hashes:
+            # Other-project revisions survive — clear the active pointer
+            # only if the revision it names was actually deleted.
+            if active_hash not in remaining_hashes:
+                active_revision_path(root, source_type=source_type, source_id=source_id).unlink(missing_ok=True)
+            # Job status is attributed by the project_id recorded on it at
+            # attempt time (see write_job_status) — clear it only when that
+            # matches the project being forgotten. An attempt with no
+            # recorded project (or a different, surviving one) is left
+            # alone: there's no way to prove it belongs to the project
+            # being forgotten, and erasure must never over-delete.
+            job_path = job_status_path(root, source_type=source_type, source_id=source_id)
+            if job_path.exists() and read_json(job_path).get("project_id") == project_id:
+                job_path.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(source_dir)
+    return record_ids, active_revision_removed

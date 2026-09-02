@@ -99,6 +99,10 @@ def run_extraction(
             status=status,
             reason=reason,
             attempted_hash=hash_value,
+            # Not part of the KnowledgeExtractor Protocol — introspected
+            # defensively so extractors that don't expose it (e.g. simple
+            # test doubles) still work, just without project attribution.
+            project_id=getattr(extractor, "project_id", None),
         )
         return ExtractionOutcome(status=status, hash_value=hash_value, reason=reason)
 

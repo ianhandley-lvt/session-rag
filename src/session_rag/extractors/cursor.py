@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .base import (
     Attribution,
+    EvidenceLocation,
     ExtractedKnowledge,
     ExtractionBlocked,
     ExtractionError,
@@ -17,7 +18,7 @@ from .base import (
     ProjectProvenance,
     StructuredRecord,
 )
-from ..sanitize import DEFAULT_MAX_SANITIZED_CHARS, SanitizationBudgetExceeded, sanitize_session
+from ..sanitize import DEFAULT_MAX_SANITIZED_CHARS, SanitizationBudgetExceeded, SanitizedSession, sanitize_session
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -55,6 +56,21 @@ def _person_attribution(attribution: Attribution | None) -> Attribution | None:
     if attribution and attribution.person.strip().lower() in NON_PERSON_IDENTIFIERS:
         return None
     return attribution
+
+
+def _resolved_evidence_location(location_id: str | None, sanitized: SanitizedSession) -> EvidenceLocation | None:
+    """The model proposes an identifier; application code decides whether to
+    trust it. Only an identifier that names a real entry in *this exact*
+    revision's sanitized rendering is accepted — anything else (missing,
+    or a hallucinated/invented identifier) is a forged claim about source
+    identity, rejected (null) rather than passed through."""
+
+    if not location_id:
+        return None
+    text = sanitized.text_for(location_id)
+    if text is None:
+        return None
+    return EvidenceLocation(identifier=location_id, preserved_text=text)
 
 
 def _json_from_model_text(text: str) -> dict:
@@ -122,16 +138,25 @@ class CursorExtractor:
     def prompt_version(self) -> int:
         return self._prompt_version
 
+    @property
+    def project_id(self) -> str | None:
+        """Exposed so a failed/blocked/pending_retry attempt can still
+        record which project it was configured for (see
+        pipeline.run_extraction) — an outcome with no Episode Record, so no
+        other way for Project Provenance to reach Extraction Job Status."""
+
+        return self._project.project_id if self._project else None
+
     def extract(self, transcript: Path) -> list[StructuredRecord]:
         try:
-            sanitized_content = sanitize_session(
+            sanitized = sanitize_session(
                 transcript,
                 sensitive_paths=self._sensitive_paths,
                 max_chars=self._max_sanitized_chars,
             )
         except SanitizationBudgetExceeded as error:
             raise ExtractionBlocked(str(error)) from error
-        prompt = self._prompt(sanitized_content)
+        prompt = self._prompt(sanitized.prompt_text)
         command = [
             self._executable,
             "--print",
@@ -150,10 +175,13 @@ class CursorExtractor:
         drafts = self._run_with_retries(command, prompt)
         return [
             StructuredRecord(
-                **{**draft.model_dump(), "attribution": _person_attribution(draft.attribution)},
+                **{
+                    **draft.model_dump(),
+                    "attribution": _person_attribution(draft.attribution),
+                    "evidence_location": _resolved_evidence_location(draft.evidence_location, sanitized),
+                },
                 source=str(transcript.resolve()),
                 source_session_id=transcript.stem,
-                authority="working_session",
                 source_type="claude_session",
                 operator_id=self._operator_id,
                 project=self._project,
@@ -218,6 +246,7 @@ class CursorExtractor:
                         "attribution": "object {person: string, citation: string} or null",
                         "temporal_scope": "'durable' or 'time_sensitive' or null",
                         "timestamp": "ISO-8601 string or null",
+                        "evidence_location": "the exact identifier copied from the [brackets] at the start of the one transcript_data entry supporting this record, or null",
                     }
                 ]
             },
@@ -235,6 +264,11 @@ class CursorExtractor:
                 "Set temporal_scope to 'durable' for a decision or explanation that stays valid "
                 "until explicitly superseded, or 'time_sensitive' for a description of current "
                 "system state or circumstances that could go stale without an explicit correction.",
+                "Each entry in transcript_data starts with an identifier in [brackets]. Set "
+                "evidence_location to the exact identifier — copied verbatim from those brackets, "
+                "unmodified — of the single entry that most directly supports this record, or "
+                "null if no single entry does. Never invent an identifier that does not appear in "
+                "transcript_data.",
             ],
             "transcript_data": content,
         }

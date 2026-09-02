@@ -36,12 +36,13 @@ class RetrievalScope:
     def permits(self, candidate_project_id: str) -> bool:
         if self.global_scope:
             return True
-        # CONTEXT.md's own rationale for Retrieval Scope is preventing
-        # cross-workspace disclosure, not a blanket opt-in gate: with no
-        # current project configured, there is no *other* workspace to leak
-        # against, so an unscoped record matching an unscoped query is not
-        # the disclosure this boundary exists to stop. A real project_id
-        # never matches "" here, so cross-project leakage still can't happen.
+        # Records without project provenance are visible only under an
+        # *explicitly enabled* global scope — never as a side effect of the
+        # current query also lacking a configured project_id. No implicit
+        # third scope state; a real project_id never matches "" here either,
+        # so cross-project leakage still can't happen through this path.
+        if not candidate_project_id:
+            return False
         return candidate_project_id == (self.project_id or "")
 
 
@@ -58,6 +59,7 @@ class RetrievalConfig:
     time_sensitive_half_life_days: float = 21.0
     unknown_age_days: float = 3650.0  # unknown timestamp — treat as very stale, never free-ranked
     fetch_multiplier: int = 3  # candidates fetched per method = max_results * fetch_multiplier
+    verified_boost: float = 1.2  # fixed ranking boost for verified over unreviewed, any temporal_scope
 
     @classmethod
     def from_env(cls) -> "RetrievalConfig":
@@ -170,6 +172,16 @@ def _rank_score(candidate: dict) -> float:
     return score
 
 
+def _verification_boost(verification_status: str, config: RetrievalConfig) -> float:
+    """A fixed boost for verified over unreviewed — independent of
+    temporal_scope, so a verified time_sensitive record still outranks an
+    otherwise-equal unreviewed time_sensitive record of the same age (decay
+    alone doesn't distinguish those two, since decay only special-cases
+    durable)."""
+
+    return config.verified_boost if verification_status == "verified" else 1.0
+
+
 def search(
     database: Path,
     artifacts_root: Path,
@@ -236,10 +248,12 @@ def search(
         decay = _decay_multiplier(
             state["verification_status"], candidate.get("temporal_scope"), candidate.get("timestamp", ""), config
         )
-        final_score = _rank_score(candidate) * decay
+        boost = _verification_boost(state["verification_status"], config)
+        final_score = _rank_score(candidate) * decay * boost
         entry["excluded_reason"] = None
         entry["verification_status"] = state["verification_status"]
         entry["decay_multiplier"] = decay
+        entry["verification_boost"] = boost
         entry["final_score"] = final_score
         trace["candidates"].append(entry)
         survivors.append((final_score, candidate))

@@ -56,6 +56,13 @@ def index_episode_records(database: Path, records: list[dict], embedder: Embedde
             "project_id": (record.get("project") or {}).get("project_id") or "",
             "temporal_scope": record.get("temporal_scope") or "",
             "timestamp": record.get("timestamp") or "",
+            # Flat identifier only — LanceDB is a disposable derived index
+            # (ADR-0001), so the preserved evidence text isn't duplicated
+            # here; it lives in the Extraction Artifact, the system of
+            # record, and is resolved from there (see artifacts.find_record).
+            # Empty string for "no location", consistent with this file's
+            # other optional-field conventions (project_id, temporal_scope).
+            "evidence_location_id": (record.get("evidence_location") or {}).get("identifier") or "",
             "embedding_model": embedder.model_name,
             "vector": vector,
         }

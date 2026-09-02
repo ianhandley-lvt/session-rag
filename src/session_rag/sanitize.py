@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_MAX_SANITIZED_CHARS = 20_000
@@ -21,6 +22,48 @@ _SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
     re.compile(r"(?i)(?:api[_-]?key|secret|token|password)['\"]?\s*[:=]\s*['\"]([^'\"\s]{8,})['\"]"),
 ]
+
+
+@dataclass(frozen=True)
+class SanitizedEntry:
+    """One turn of a sanitized session, addressable by a stable identifier
+    that is independent of its position in the rendered text — a turn's own
+    rendered text can itself span multiple lines (a multi-block message), and
+    turns with no renderable content are skipped without shifting any other
+    entry's identifier (see sanitize_session)."""
+
+    identifier: str
+    text: str
+
+
+@dataclass(frozen=True)
+class SanitizedSession:
+    """Sanitized, provider-safe rendering of one source revision, plus the
+    deterministic entry-identifier mapping Evidence Location needs (see
+    extractors.base.EvidenceLocation) — sanitize_session is the only place
+    that ever has both the raw transcript's true per-turn identity and the
+    provider-safe text, so it's the only place that mapping can be built."""
+
+    entries: list[SanitizedEntry]
+
+    @property
+    def prompt_text(self) -> str:
+        """What's sent to the extraction provider — each entry prefixed with
+        its stable identifier in brackets, so the model can copy one rather
+        than counting or guessing a position."""
+
+        return "\n".join(f"[{entry.identifier}] {entry.text}" for entry in self.entries)
+
+    def text_for(self, identifier: str) -> str | None:
+        """None if identifier doesn't name a real entry in this exact
+        revision's sanitized rendering — the only membership test Evidence
+        Location validation needs, and the only way a preserved snippet is
+        ever looked up."""
+
+        for entry in self.entries:
+            if entry.identifier == identifier:
+                return entry.text
+        return None
 
 
 class SanitizationBudgetExceeded(RuntimeError):
@@ -132,14 +175,31 @@ def _render_block(block: dict, *, tool_output_limit: int, tool_uses: dict[str, d
     return None
 
 
+def _entry_identifier(record: dict, raw_index: int) -> str:
+    """Prefer the transcript's own stable per-turn identifier (its `uuid`,
+    when the source provides one) over a fallback derived from raw file
+    position — a source-provided uuid survives edits to the file itself,
+    unlike a position. `raw_index` is the turn's 0-indexed position among
+    *all* raw JSONL lines (computed before any skip-filtering), so a
+    fallback identifier never shifts when an earlier record turns out to be
+    unparsable or renders no content."""
+
+    uuid_value = record.get("uuid")
+    if isinstance(uuid_value, str) and uuid_value:
+        return uuid_value
+    return f"line-{raw_index}"
+
+
 def sanitize_session(
     path: Path,
     *,
     sensitive_paths: tuple[str, ...] = (),
     max_chars: int = DEFAULT_MAX_SANITIZED_CHARS,
     tool_output_limit: int = MAX_TOOL_OUTPUT_CHARS,
-) -> str:
-    """Render a session transcript into sanitized, provider-safe text.
+) -> SanitizedSession:
+    """Render a session transcript into a SanitizedSession: sanitized,
+    provider-safe text plus the stable identifier -> text mapping Evidence
+    Location resolution needs.
 
     Preserves user, assistant, tool, and subagent evidence (tool/subagent
     content is never dropped, unlike the raw turn parser), replaces oversized
@@ -148,9 +208,9 @@ def sanitize_session(
     than silently truncating when the result is still too large.
     """
 
-    lines: list[str] = []
+    entries: list[SanitizedEntry] = []
     tool_uses: dict[str, dict] = {}
-    for raw_line in path.read_text(errors="replace").splitlines():
+    for raw_index, raw_line in enumerate(path.read_text(errors="replace").splitlines()):
         try:
             record = json.loads(raw_line)
         except json.JSONDecodeError:
@@ -167,9 +227,10 @@ def sanitize_session(
         rendered_text = "\n".join(part for part in rendered if part)
         if not rendered_text:
             continue
-        lines.append(f"{_speaker(record)}: {rendered_text}")
+        text = redact_secrets(f"{_speaker(record)}: {rendered_text}", sensitive_paths=sensitive_paths)
+        entries.append(SanitizedEntry(identifier=_entry_identifier(record, raw_index), text=text))
 
-    sanitized = redact_secrets("\n".join(lines), sensitive_paths=sensitive_paths)
-    if len(sanitized) > max_chars:
-        raise SanitizationBudgetExceeded(len(sanitized), max_chars)
+    sanitized = SanitizedSession(entries=entries)
+    if len(sanitized.prompt_text) > max_chars:
+        raise SanitizationBudgetExceeded(len(sanitized.prompt_text), max_chars)
     return sanitized
