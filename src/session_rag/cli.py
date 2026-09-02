@@ -21,6 +21,7 @@ from .overlay import (
     verify,
 )
 from .pipeline import run_extraction
+from .retrieval import RetrievalScope
 from .retrieval import search as retrieval_search
 from .store import Embedder, index_episode_records
 
@@ -28,6 +29,20 @@ from .store import Embedder, index_episode_records
 def _add_record_command_args(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("record_id")
     subparser.add_argument("--artifacts", type=Path, required=True)
+
+
+def _add_scope_args(subparser: argparse.ArgumentParser) -> None:
+    # Deliberately CLI/env-only — never derived from the query/prompt text
+    # itself (ADR-0004). Unset means "fall back to SESSION_RAG_PROJECT_ID /
+    # SESSION_RAG_GLOBAL_SCOPE" (RetrievalScope.from_env()).
+    subparser.add_argument("--project-id")
+    subparser.add_argument("--global-scope", action="store_true", default=None)
+
+
+def _scope_from_args(args: argparse.Namespace) -> RetrievalScope | None:
+    if args.project_id is None and args.global_scope is None:
+        return None
+    return RetrievalScope(project_id=args.project_id, global_scope=bool(args.global_scope))
 
 
 def parser() -> argparse.ArgumentParser:
@@ -46,9 +61,11 @@ def parser() -> argparse.ArgumentParser:
     search_cmd.add_argument("query")
     search_cmd.add_argument("--database", type=Path, required=True)
     search_cmd.add_argument("--artifacts", type=Path, required=True)
+    _add_scope_args(search_cmd)
     hook = commands.add_parser("hook")
     hook.add_argument("--database", type=Path, required=True)
     hook.add_argument("--artifacts", type=Path, required=True)
+    _add_scope_args(hook)
     _add_record_command_args(commands.add_parser("verify"))
     _add_record_command_args(commands.add_parser("reject"))
     supersede_cmd = commands.add_parser("supersede")
@@ -110,13 +127,16 @@ def run(
         )
     elif args.command == "search":
         selected_embedder = embedder or FastEmbedder()
-        results, _trace = retrieval_search(args.database, args.artifacts, args.query, selected_embedder)
+        results, _trace = retrieval_search(
+            args.database, args.artifacts, args.query, selected_embedder, scope=_scope_from_args(args)
+        )
         print(format_context(results) if results else "No relevant session memory found.")
     elif args.command == "hook":
         selected_embedder = embedder or FastEmbedder()
+        scope = _scope_from_args(args)
         try:
             event = json.load(sys.stdin)
-            print(json.dumps(handle_user_prompt(event, args.database, args.artifacts, selected_embedder)))
+            print(json.dumps(handle_user_prompt(event, args.database, args.artifacts, selected_embedder, scope=scope)))
         except Exception:
             print("{}")
     elif args.command in {"verify", "reject", "supersede", "history"}:
