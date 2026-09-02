@@ -80,6 +80,58 @@ def test_cli_ingests_from_artifacts_and_returns_cited_search_results(tmp_path, c
     assert "session-123" in output
 
 
+def test_cli_uses_storage_paths_from_toml_config(tmp_path, capsys):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{artifacts_dir}"\n'
+        f'database = "{database}"\n'
+        'operator_id = "ian"\n'
+    )
+    _extract_and_activate(
+        artifacts_dir,
+        transcript,
+        "why did rabbitmq reconnect",
+        question="Why did RabbitMQ reconnect?",
+        summary="The heartbeat timeout caused the reconnect.",
+    )
+    embedder = KeywordEmbedder()
+    capsys.readouterr()
+
+    assert run(["--config", str(config_path), "ingest"], embedder) == 0
+    assert run(["--config", str(config_path), "search", "rabbitmq timeout", "--global-scope"], embedder) == 0
+
+    output = capsys.readouterr().out
+    assert "heartbeat timeout caused the reconnect" in output
+
+
+def test_cli_config_show_reports_effective_project_for_current_directory(tmp_path, capsys, monkeypatch):
+    project_root = tmp_path / "lvcore"
+    project_root.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n'
+        'operator_id = "ian"\n'
+        '[extractor]\n'
+        'mode = "ask"\n'
+        'model = "test-model"\n'
+        'max_sanitized_chars = 500000\n'
+        '[projects.lvcore]\n'
+        f'root = "{project_root}"\n'
+    )
+    monkeypatch.chdir(project_root)
+
+    assert run(["--config", str(config_path), "config", "show"]) == 0
+
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["operator_id"] == "ian"
+    assert shown["extractor"]["max_sanitized_chars"] == 500000
+    assert shown["project"] == {"id": "lvcore", "root": str(project_root), "knowledge_base": None}
+
+
 def test_user_prompt_hook_returns_additional_context(tmp_path):
     transcript = tmp_path / "session-123.jsonl"
     artifacts_dir = tmp_path / "artifacts"

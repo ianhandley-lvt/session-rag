@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
+from .app_config import ConfigError, ResolvedAppConfig, load_app_config, resolve_app_config
 from .artifacts import find_record, find_sources_by_project, forget_source, load_active_episode_records
 from .embeddings import FastEmbedder
 from .extractors import create_extractor
-from .extractors.base import KnowledgeExtractor
+from .extractors.base import KnowledgeExtractor, ProjectProvenance
 from .hook import format_context, handle_user_prompt
 from .markdown_kb import MarkdownKnowledgeBaseExtractor, markdown_articles, markdown_source_id
 from .overlay import (
@@ -31,7 +33,13 @@ from .store import Embedder, delete_by_source_id, index_episode_records
 
 def _add_record_command_args(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("record_id")
-    subparser.add_argument("--artifacts", type=Path, required=True)
+    subparser.add_argument("--artifacts", type=Path)
+
+
+def _add_storage_args(subparser: argparse.ArgumentParser, *, database: bool = True) -> None:
+    subparser.add_argument("--artifacts", type=Path)
+    if database:
+        subparser.add_argument("--database", type=Path)
 
 
 def _add_scope_args(subparser: argparse.ArgumentParser) -> None:
@@ -42,40 +50,45 @@ def _add_scope_args(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument("--global-scope", action="store_true", default=None)
 
 
-def _scope_from_args(args: argparse.Namespace) -> RetrievalScope | None:
+def _scope_from_args(args: argparse.Namespace, resolved: ResolvedAppConfig) -> RetrievalScope:
     if args.project_id is None and args.global_scope is None:
-        return None
+        return RetrievalScope(
+            project_id=resolved.project_id,
+            global_scope=os.getenv("SESSION_RAG_GLOBAL_SCOPE", "").lower() == "true",
+        )
     return RetrievalScope(project_id=args.project_id, global_scope=bool(args.global_scope))
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="session-rag")
+    result.add_argument("--config", type=Path, help="TOML config path (default: ~/.config/session-rag/config.toml)")
     commands = result.add_subparsers(dest="command", required=True)
     ingest = commands.add_parser("ingest")
-    ingest.add_argument("--artifacts", type=Path, required=True)
-    ingest.add_argument("--database", type=Path, required=True)
+    _add_storage_args(ingest)
     markdown = commands.add_parser("import-markdown-kb")
-    markdown.add_argument("wiki_dir", type=Path)
+    markdown.add_argument("wiki_dir", type=Path, nargs="?")
     markdown.add_argument("--knowledge-base-id", required=True)
-    markdown.add_argument("--project-id", required=True)
+    markdown.add_argument("--project-id")
     markdown.add_argument("--project-root")
     markdown.add_argument("--operator-id")
     markdown.add_argument("--temporal-scope", choices=["durable", "time_sensitive"], default="time_sensitive")
-    markdown.add_argument("--artifacts", type=Path, required=True)
+    _add_storage_args(markdown, database=False)
     extract = commands.add_parser("extract-session")
     extract.add_argument("transcript", type=Path)
-    extract.add_argument("--artifacts", type=Path, required=True)
-    extract.add_argument("--extractor", default="cursor", choices=["cursor"])
+    _add_storage_args(extract, database=False)
+    extract.add_argument("--extractor", choices=["cursor"])
     extract.add_argument("--cursor-mode", choices=["ask", "plan"])
     extract.add_argument("--cursor-model")
+    extract.add_argument("--operator-id")
+    extract.add_argument("--project-id")
+    extract.add_argument("--project-root")
+    extract.add_argument("--max-sanitized-chars", type=int)
     search_cmd = commands.add_parser("search")
     search_cmd.add_argument("query")
-    search_cmd.add_argument("--database", type=Path, required=True)
-    search_cmd.add_argument("--artifacts", type=Path, required=True)
+    _add_storage_args(search_cmd)
     _add_scope_args(search_cmd)
     hook = commands.add_parser("hook")
-    hook.add_argument("--database", type=Path, required=True)
-    hook.add_argument("--artifacts", type=Path, required=True)
+    _add_storage_args(hook)
     _add_scope_args(hook)
     _add_record_command_args(commands.add_parser("verify"))
     _add_record_command_args(commands.add_parser("reject"))
@@ -86,9 +99,56 @@ def parser() -> argparse.ArgumentParser:
     forget_cmd = commands.add_parser("forget")
     forget_cmd.add_argument("source_id", nargs="?")
     forget_cmd.add_argument("--project")
-    forget_cmd.add_argument("--artifacts", type=Path, required=True)
-    forget_cmd.add_argument("--database", type=Path, required=True)
+    _add_storage_args(forget_cmd)
+    config_cmd = commands.add_parser("config")
+    config_commands = config_cmd.add_subparsers(dest="config_command", required=True)
+    config_commands.add_parser("show")
     return result
+
+
+def _explicit_config(args: argparse.Namespace) -> dict[str, object]:
+    names = (
+        "artifacts",
+        "database",
+        "operator_id",
+        "project_id",
+        "project_root",
+        "cursor_mode",
+        "cursor_model",
+        "max_sanitized_chars",
+    )
+    values = {name: getattr(args, name, None) for name in names}
+    values["extractor_provider"] = getattr(args, "extractor", None)
+    return values
+
+
+def _require(value, name: str):
+    if value is None:
+        raise ConfigError(
+            f"{name} is required; pass --{name.replace('_', '-')} or configure it in "
+            "~/.config/session-rag/config.toml"
+        )
+    return value
+
+
+def _config_display(resolved: ResolvedAppConfig) -> dict:
+    return {
+        "config_path": str(resolved.config_path) if resolved.config_path else None,
+        "operator_id": resolved.operator_id,
+        "artifacts": str(resolved.artifacts) if resolved.artifacts else None,
+        "database": str(resolved.database) if resolved.database else None,
+        "extractor": {
+            "provider": resolved.extractor_provider,
+            "mode": resolved.cursor_mode,
+            "model": resolved.cursor_model,
+            "max_sanitized_chars": resolved.max_sanitized_chars,
+        },
+        "project": {
+            "id": resolved.project_id,
+            "root": str(resolved.project_root) if resolved.project_root else None,
+            "knowledge_base": str(resolved.knowledge_base) if resolved.knowledge_base else None,
+        },
+    }
 
 
 def _forget_sources(artifacts_root: Path, database: Path, source_ids: list[str], *, project_id: str | None = None) -> int:
@@ -120,38 +180,62 @@ def run(
     extractor: KnowledgeExtractor | None = None,
 ) -> int:
     args = parser().parse_args(arguments)
+    try:
+        app_config = load_app_config(args.config)
+        resolved = resolve_app_config(app_config, cwd=Path.cwd(), explicit=_explicit_config(args))
+    except ConfigError as error:
+        print(f"configuration error: {error}", file=sys.stderr)
+        return 3
+
+    if args.command == "config":
+        print(json.dumps(_config_display(resolved), indent=2))
+        return 0
+
+    try:
+        artifacts = _require(resolved.artifacts, "artifacts")
+        database = (
+            _require(resolved.database, "database")
+            if args.command in {"ingest", "search", "hook", "forget"}
+            else resolved.database
+        )
+    except ConfigError as error:
+        print(f"configuration error: {error}", file=sys.stderr)
+        return 3
+
     if args.command == "ingest":
         selected_embedder = embedder or FastEmbedder()
-        records = filter_retrievable(args.artifacts, load_active_episode_records(args.artifacts))
-        count = index_episode_records(args.database, records, selected_embedder)
-        print(f"Indexed {count} episode records in {args.database}")
+        records = filter_retrievable(artifacts, load_active_episode_records(artifacts))
+        count = index_episode_records(database, records, selected_embedder)
+        print(f"Indexed {count} episode records in {database}")
     elif args.command == "import-markdown-kb":
-        if not args.wiki_dir.is_dir():
-            print(f"not a directory: {args.wiki_dir}", file=sys.stderr)
+        wiki_dir = args.wiki_dir or resolved.knowledge_base
+        project_id = args.project_id or resolved.project_id
+        if wiki_dir is None or not wiki_dir.is_dir():
+            print(f"not a directory: {wiki_dir}", file=sys.stderr)
             return 1
         try:
             markdown_extractor = MarkdownKnowledgeBaseExtractor(
                 knowledge_base_id=args.knowledge_base_id,
-                project_id=args.project_id,
-                project_root=args.project_root,
-                operator_id=args.operator_id,
+                project_id=_require(project_id, "project_id"),
+                project_root=str(resolved.project_root) if resolved.project_root else None,
+                operator_id=resolved.operator_id,
                 temporal_scope=args.temporal_scope,
             )
         except ValueError as error:
             print(f"configuration error: {error}", file=sys.stderr)
             return 3
 
-        articles = markdown_articles(args.wiki_dir)
+        articles = markdown_articles(wiki_dir)
         activated = 0
         unchanged = 0
         blocked = 0
         record_count = 0
         for article in articles:
-            source_id = markdown_source_id(args.knowledge_base_id, args.wiki_dir, article)
+            source_id = markdown_source_id(args.knowledge_base_id, wiki_dir, article)
             outcome = run_extraction(
                 markdown_extractor,
                 article,
-                args.artifacts,
+                artifacts,
                 source_type="markdown_knowledge_base",
                 source_id=source_id,
             )
@@ -169,16 +253,31 @@ def run(
             return 2
     elif args.command == "extract-session":
         try:
+            project = (
+                ProjectProvenance(
+                    project_id=resolved.project_id,
+                    project_root=str(resolved.project_root) if resolved.project_root else None,
+                    repository_revision=os.getenv("SESSION_RAG_REPOSITORY_REVISION") or None,
+                    working_tree_dirty=(os.getenv("SESSION_RAG_WORKING_TREE_DIRTY", "").lower() == "true")
+                    if os.getenv("SESSION_RAG_WORKING_TREE_DIRTY")
+                    else None,
+                )
+                if resolved.project_id
+                else None
+            )
             selected_extractor = extractor or create_extractor(
-                args.extractor,
-                cursor_mode=args.cursor_mode,
-                cursor_model=args.cursor_model,
+                resolved.extractor_provider,
+                cursor_mode=resolved.cursor_mode,
+                cursor_model=resolved.cursor_model,
+                max_sanitized_chars=resolved.max_sanitized_chars,
+                operator_id=resolved.operator_id,
+                project=project,
             )
         except ValueError as error:
             print(f"configuration error: {error}", file=sys.stderr)
             return 3
 
-        outcome = run_extraction(selected_extractor, args.transcript, args.artifacts)
+        outcome = run_extraction(selected_extractor, args.transcript, artifacts)
 
         if outcome.status == "blocked":
             print(f"blocked: {outcome.reason}", file=sys.stderr)
@@ -209,7 +308,7 @@ def run(
     elif args.command == "search":
         selected_embedder = embedder or FastEmbedder()
         results, _trace = retrieval_search(
-            args.database, args.artifacts, args.query, selected_embedder, scope=_scope_from_args(args)
+            database, artifacts, args.query, selected_embedder, scope=_scope_from_args(args, resolved)
         )
         print(format_context(results) if results else "No relevant session memory found.")
     elif args.command == "hook":
@@ -219,13 +318,13 @@ def run(
         # retrieval_timeout_ms, defeating the fail-open guarantee. A
         # caller-supplied embedder (e.g. tests) bypasses the factory and is
         # used directly.
-        scope = _scope_from_args(args)
+        scope = _scope_from_args(args, resolved)
         try:
             event = json.load(sys.stdin)
             result = handle_user_prompt(
                 event,
-                args.database,
-                args.artifacts,
+                database,
+                artifacts,
                 embedder=embedder,
                 embedder_factory=None if embedder else FastEmbedder,
                 scope=scope,
@@ -234,24 +333,24 @@ def run(
         except Exception:
             print("{}")
     elif args.command in {"verify", "reject", "supersede", "history"}:
-        record = find_record(args.artifacts, args.record_id)
+        record = find_record(artifacts, args.record_id)
         if record is None:
             print(f"no such record: {args.record_id}", file=sys.stderr)
             return 1
 
         if args.command == "history":
-            state = read_state(args.artifacts, args.record_id)
+            state = read_state(artifacts, args.record_id)
             print(json.dumps({**record, **state}, indent=2))
             return 0
 
         verb = {"verify": "verified", "reject": "rejected", "supersede": "superseded"}[args.command]
         try:
             if args.command == "verify":
-                verify(args.artifacts, args.record_id)
+                verify(artifacts, args.record_id)
             elif args.command == "reject":
-                reject(args.artifacts, args.record_id)
+                reject(artifacts, args.record_id)
             else:
-                supersede(args.artifacts, args.record_id, args.replacement_id)
+                supersede(artifacts, args.record_id, args.replacement_id)
         except (InvalidTransition, SupersedeRequiresReplacement, UnknownReplacementRecord) as error:
             print(f"error: {error}", file=sys.stderr)
             return 1
@@ -265,10 +364,10 @@ def run(
             label = f"source {args.source_id}"
             project_id = None
         else:
-            source_ids = find_sources_by_project(args.artifacts, args.project)
+            source_ids = find_sources_by_project(artifacts, args.project)
             label = f"project {args.project}"
             project_id = args.project
-        total_records = _forget_sources(args.artifacts, args.database, source_ids, project_id=project_id)
+        total_records = _forget_sources(artifacts, database, source_ids, project_id=project_id)
         # Terminal-only, one-time — never written to a file, matching the
         # erasure guarantee (no record of the deletion itself is retained).
         print(f"forgot {total_records} record(s) across {len(source_ids)} source(s) for {label}")
