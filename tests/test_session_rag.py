@@ -2,6 +2,8 @@ import json
 import shutil
 from pathlib import Path
 
+import pytest
+
 from session_rag.artifacts import artifact_path, job_status_path, read_active_hash
 from session_rag.cli import run
 from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry
@@ -354,3 +356,161 @@ def test_hook_fails_open_when_database_does_not_exist(tmp_path):
     )
 
     assert response == {}
+
+
+def _extract_and_get_record_id(artifacts_dir, transcript, content, question, summary, capsys):
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": content}}) + "\n")
+    record = make_record(question=question, summary=summary, source=str(transcript.resolve()), source_session_id=transcript.stem)
+    capsys.readouterr()
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts_dir)], extractor=FakeExtractor([record]))
+    output = json.loads(capsys.readouterr().out)
+    return output["records"][0]["id"]
+
+
+def test_verify_transitions_unreviewed_to_verified(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    transcript = tmp_path / "session-123.jsonl"
+    record_id = _extract_and_get_record_id(artifacts_dir, transcript, "hi", "Q", "S", capsys)
+
+    exit_code = run(["verify", record_id, "--artifacts", str(artifacts_dir)])
+
+    assert exit_code == 0
+    assert f"verified {record_id}" in capsys.readouterr().out
+    exit_code = run(["history", record_id, "--artifacts", str(artifacts_dir)])
+    history = json.loads(capsys.readouterr().out)
+    assert history["verification_status"] == "verified"
+
+
+def test_reject_then_reject_again_is_an_invalid_transition(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    transcript = tmp_path / "session-123.jsonl"
+    record_id = _extract_and_get_record_id(artifacts_dir, transcript, "hi", "Q", "S", capsys)
+
+    run(["reject", record_id, "--artifacts", str(artifacts_dir)])
+    capsys.readouterr()
+    exit_code = run(["reject", record_id, "--artifacts", str(artifacts_dir)])
+
+    assert exit_code == 1
+    assert "cannot move from 'rejected'" in capsys.readouterr().err
+
+
+def test_supersede_requires_replacement_id_argument(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    transcript = tmp_path / "session-123.jsonl"
+    record_id = _extract_and_get_record_id(artifacts_dir, transcript, "hi", "Q", "S", capsys)
+
+    with pytest.raises(SystemExit):
+        run(["supersede", record_id, "--artifacts", str(artifacts_dir)])
+
+
+def test_supersede_records_replacement_link_and_is_visible_via_history(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    old_transcript = tmp_path / "old-session.jsonl"
+    new_transcript = tmp_path / "new-session.jsonl"
+    old_id = _extract_and_get_record_id(artifacts_dir, old_transcript, "hi old", "Q old", "S old", capsys)
+    new_id = _extract_and_get_record_id(artifacts_dir, new_transcript, "hi new", "Q new", "S new", capsys)
+
+    exit_code = run(["supersede", old_id, new_id, "--artifacts", str(artifacts_dir)])
+    capsys.readouterr()
+    run(["history", old_id, "--artifacts", str(artifacts_dir)])
+    history = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert history["verification_status"] == "superseded"
+    assert history["superseded_by"] == new_id
+
+
+def test_supersede_rejects_a_nonexistent_replacement_id(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    transcript = tmp_path / "session-123.jsonl"
+    record_id = _extract_and_get_record_id(artifacts_dir, transcript, "hi", "Q", "S", capsys)
+
+    exit_code = run(["supersede", record_id, "sha256:doesnotexist:0", "--artifacts", str(artifacts_dir)])
+
+    assert exit_code == 1
+    assert "does not exist" in capsys.readouterr().err
+
+
+def test_verify_unknown_record_id_fails_clearly(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+
+    exit_code = run(["verify", "sha256:doesnotexist:0", "--artifacts", str(artifacts_dir)])
+
+    assert exit_code == 1
+    assert "no such record" in capsys.readouterr().err
+
+
+def test_rejected_records_excluded_from_search_but_visible_via_history(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript = tmp_path / "session-123.jsonl"
+    record_id = _extract_and_get_record_id(
+        artifacts_dir, transcript, "why did rabbitmq reconnect", "Q", "RabbitMQ heartbeat issue", capsys
+    )
+    run(["reject", record_id, "--artifacts", str(artifacts_dir)])
+
+    embedder = KeywordEmbedder()
+    capsys.readouterr()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+    capsys.readouterr()
+    run(["search", "rabbitmq", "--database", str(database)], embedder)
+    search_output = capsys.readouterr().out
+
+    assert "RabbitMQ heartbeat issue" not in search_output
+    assert "No relevant session memory found" in search_output
+
+    run(["history", record_id, "--artifacts", str(artifacts_dir)])
+    history_output = json.loads(capsys.readouterr().out)
+    assert history_output["verification_status"] == "rejected"
+    assert history_output["question"] == "Q"
+
+
+def test_verification_state_survives_lancedb_rebuild(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    rejected_transcript = tmp_path / "rejected-session.jsonl"
+    kept_transcript = tmp_path / "kept-session.jsonl"
+    rejected_id = _extract_and_get_record_id(
+        artifacts_dir, rejected_transcript, "why did rabbitmq reconnect", "Q1", "RabbitMQ heartbeat issue", capsys
+    )
+    _extract_and_get_record_id(
+        artifacts_dir, kept_transcript, "why did postgres crash", "Q2", "Postgres out of memory", capsys
+    )
+    run(["reject", rejected_id, "--artifacts", str(artifacts_dir)])
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    # Deleting the derived index must not lose verification state — it lives
+    # in the overlay, outside both the artifact and LanceDB.
+    shutil.rmtree(database)
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+    capsys.readouterr()
+    run(["search", "rabbitmq postgres", "--database", str(database)], embedder)
+    output = capsys.readouterr().out
+
+    assert "RabbitMQ heartbeat issue" not in output
+    assert "Postgres out of memory" in output
+
+
+def test_supersession_link_survives_lancedb_rebuild(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    old_transcript = tmp_path / "old-session.jsonl"
+    new_transcript = tmp_path / "new-session.jsonl"
+    old_id = _extract_and_get_record_id(artifacts_dir, old_transcript, "hi old", "Q old", "S old", capsys)
+    new_id = _extract_and_get_record_id(artifacts_dir, new_transcript, "hi new", "Q new", "S new", capsys)
+    run(["supersede", old_id, new_id, "--artifacts", str(artifacts_dir)])
+
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+    if database.exists():
+        shutil.rmtree(database)
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    capsys.readouterr()
+    run(["history", old_id, "--artifacts", str(artifacts_dir)])
+    history = json.loads(capsys.readouterr().out)
+
+    assert history["verification_status"] == "superseded"
+    assert history["superseded_by"] == new_id
