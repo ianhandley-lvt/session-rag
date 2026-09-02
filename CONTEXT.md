@@ -9,7 +9,7 @@ One resumable unit of durable knowledge about a decision, explanation, or proble
 _Avoid_: Turn, session, chunk, problem-resolution episode
 
 **Episode Record**:
-The validated, schema-checked, provenance-attached persisted representation of one Knowledge Episode. What the extractor's raw draft becomes once trusted fields (source, source hash, authority) are attached and it passes the strict schema.
+The validated, schema-checked, provenance-attached persisted representation of one Knowledge Episode. What the extractor's raw draft becomes once trusted provenance is attached and it passes the strict schema.
 _Avoid_: Episode (when the persisted/validated artifact specifically is meant, not the underlying real-world unit), record (ambiguous alone)
 
 **Source Type**:
