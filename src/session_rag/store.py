@@ -52,6 +52,7 @@ def index_episode_records(database: Path, records: list[dict], embedder: Embedde
             "source_id": record["source_id"],
             "source_session_id": record["source_session_id"],
             "source_hash": record["source_hash"],
+            "project_id": (record.get("project") or {}).get("project_id") or "",
             "temporal_scope": record.get("temporal_scope") or "",
             "timestamp": record.get("timestamp") or "",
             "embedding_model": embedder.model_name,

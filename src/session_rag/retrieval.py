@@ -16,6 +16,34 @@ _ENV_PREFIX = "SESSION_RAG_"
 
 
 @dataclass(frozen=True)
+class RetrievalScope:
+    """Retrieval Scope (ADR-0004): trusted, application-supplied — never
+    derived from the submitted prompt/query text, which is untrusted and
+    must never be able to choose or widen its own retrieval scope."""
+
+    project_id: str | None = None
+    global_scope: bool = False
+
+    @classmethod
+    def from_env(cls) -> "RetrievalScope":
+        return cls(
+            project_id=os.getenv("SESSION_RAG_PROJECT_ID") or None,
+            global_scope=os.getenv("SESSION_RAG_GLOBAL_SCOPE", "").lower() == "true",
+        )
+
+    def permits(self, candidate_project_id: str) -> bool:
+        if self.global_scope:
+            return True
+        # CONTEXT.md's own rationale for Retrieval Scope is preventing
+        # cross-workspace disclosure, not a blanket opt-in gate: with no
+        # current project configured, there is no *other* workspace to leak
+        # against, so an unscoped record matching an unscoped query is not
+        # the disclosure this boundary exists to stop. A real project_id
+        # never matches "" here, so cross-project leakage still can't happen.
+        return candidate_project_id == (self.project_id or "")
+
+
+@dataclass(frozen=True)
 class RetrievalConfig:
     """All relevance-gate and ranking constants — provisional defaults, meant
     to be tuned later from real Retrieval Traces and an evaluation corpus,
@@ -154,18 +182,24 @@ def search(
     query: str,
     embedder: Embedder,
     config: RetrievalConfig | None = None,
+    scope: RetrievalScope | None = None,
 ) -> tuple[list[dict], dict]:
     """Relevance-gated, authority-ranked search. Order: (1) relevance gate on
-    raw signals, (2) exclude rejected/superseded/non-active-revision via the
-    Record State Overlay and Active Revision, (3) rank survivors by the
-    authority policy (verification_status + temporal_scope + recency,
-    computed here — never stored, ADR-0002), (4) cap at max_results.
+    raw signals, (2) exclude rejected/superseded/non-active-revision/
+    out-of-scope via the Record State Overlay, Active Revision, and
+    Retrieval Scope, (3) rank survivors by the authority policy
+    (verification_status + temporal_scope + recency, computed here — never
+    stored, ADR-0002), (4) cap at max_results.
+
+    `scope` is trusted, application-supplied context (see RetrievalScope) —
+    it must never be derived from `query`, which is untrusted prompt text.
 
     Returns (results, trace) — the Retrieval Trace records every candidate's
     raw scores and why it was excluded or kept, for later threshold tuning.
     """
 
     config = config or RetrievalConfig.from_env()
+    scope = scope or RetrievalScope.from_env()
     trace: dict = {"query": query, "candidates": []}
     if not query.strip():
         return [], trace
@@ -197,6 +231,11 @@ def search(
         )
         if active_hash != candidate.get("source_hash"):
             entry["excluded_reason"] = "non_active_revision"
+            trace["candidates"].append(entry)
+            continue
+
+        if not scope.permits(candidate.get("project_id", "")):
+            entry["excluded_reason"] = "out_of_scope"
             trace["candidates"].append(entry)
             continue
 
