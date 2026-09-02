@@ -11,8 +11,8 @@ Pass the Wiki directory, not the knowledge-base root or its `RAW/` directory. Th
 - recursively reads Markdown articles;
 - skips `INDEX.md` and `QUESTIONS.md` as navigation/work-queue files;
 - treats each article as one immutable, content-hashed source revision;
-- creates Episode Records at Markdown heading boundaries;
-- groups oversized sections at paragraph boundaries so records fit the hook's context budget;
+- creates Episode Records at Markdown heading boundaries and skips navigation-only `Related` sections;
+- groups oversized sections at paragraph boundaries, then sentence boundaries only when one paragraph is too large; a paragraph with no semantic boundary fails clearly rather than being arbitrarily word-chunked;
 - preserves article `Status`, `Last updated`, and `Sources` metadata;
 - uses the article path, heading path, preserved section text, and source hash as cited evidence;
 - defaults every imported section to `time_sensitive` unless the operator explicitly selects another Temporal Scope;

@@ -144,6 +144,7 @@ def run(
         articles = markdown_articles(args.wiki_dir)
         activated = 0
         unchanged = 0
+        blocked = 0
         record_count = 0
         for article in articles:
             source_id = markdown_source_id(args.knowledge_base_id, args.wiki_dir, article)
@@ -158,9 +159,14 @@ def run(
                 activated += 1
             elif outcome.status == "no_op":
                 unchanged += 1
+            elif outcome.status == "blocked":
+                blocked += 1
+                print(f"blocked {article}: {outcome.reason}", file=sys.stderr)
             if outcome.artifact_path:
                 record_count += len(json.loads(outcome.artifact_path.read_text())["episode_records"])
         print(json.dumps({"articles": len(articles), "records": record_count, "activated": activated, "unchanged": unchanged}))
+        if blocked:
+            return 2
     elif args.command == "extract-session":
         try:
             selected_extractor = extractor or create_extractor(

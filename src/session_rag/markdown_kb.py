@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .extractors.base import EvidenceLocation, ProjectProvenance, StructuredRecord, TemporalScope
+from .extractors.base import ExtractionBlocked, EvidenceLocation, ProjectProvenance, StructuredRecord, TemporalScope
 
 MAX_SECTION_CHARS = 3_000
 NAVIGATION_FILES = frozenset({"INDEX.md", "QUESTIONS.md"})
@@ -27,7 +28,8 @@ def _slug(value: str) -> str:
 def markdown_source_id(knowledge_base_id: str, wiki_dir: Path, article: Path) -> str:
     relative = article.relative_to(wiki_dir).with_suffix("")
     relative_slug = "--".join(_slug(part) for part in relative.parts)
-    return f"{_slug(knowledge_base_id)}--{relative_slug}"
+    path_digest = hashlib.sha256(relative.as_posix().encode()).hexdigest()[:12]
+    return f"{_slug(knowledge_base_id)}--{relative_slug}--{path_digest}"
 
 
 def markdown_articles(wiki_dir: Path) -> list[Path]:
@@ -85,18 +87,22 @@ def _sections(markdown: str) -> tuple[str, list[MarkdownSection]]:
 def _split_long_block(block: str, limit: int) -> list[str]:
     if len(block) <= limit:
         return [block]
-    words = block.split()
+    sentences = [sentence.strip() for sentence in re.split(r"(?<=[.!?])\s+", block) if sentence.strip()]
+    if len(sentences) == 1 or any(len(sentence) > limit for sentence in sentences):
+        raise ExtractionBlocked(
+            f"Markdown paragraph exceeds the {limit}-character record limit without a semantic sentence boundary"
+        )
     pieces: list[str] = []
     current: list[str] = []
     size = 0
-    for word in words:
-        added = len(word) + (1 if current else 0)
+    for sentence in sentences:
+        added = len(sentence) + (1 if current else 0)
         if current and size + added > limit:
             pieces.append(" ".join(current))
             current = []
             size = 0
-        current.append(word)
-        size += len(word) + (1 if len(current) > 1 else 0)
+        current.append(sentence)
+        size += len(sentence) + (1 if len(current) > 1 else 0)
     if current:
         pieces.append(" ".join(current))
     return pieces
@@ -185,6 +191,8 @@ class MarkdownKnowledgeBaseExtractor:
         identifiers: dict[str, int] = {}
 
         for section in sections:
+            if section.heading_path[-1].strip().lower() == "related":
+                continue
             parts = _bounded_parts(section.text)
             base_identifier = "/".join(_slug(heading) for heading in section.heading_path)
             occurrence = identifiers.get(base_identifier, 0) + 1

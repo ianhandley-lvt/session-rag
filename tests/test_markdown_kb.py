@@ -3,6 +3,7 @@ from pathlib import Path
 
 from session_rag.artifacts import artifact_path, read_active_hash
 from session_rag.cli import run
+from session_rag.markdown_kb import markdown_source_id
 
 
 class KeywordEmbedder:
@@ -40,6 +41,10 @@ def _import_args(wiki: Path, artifacts: Path) -> list[str]:
     ]
 
 
+def _source_id(wiki: Path, filename: str = "lvcore-observability.md") -> str:
+    return markdown_source_id("lvcore", wiki, wiki / filename)
+
+
 def test_cli_imports_markdown_articles_as_active_artifacts(tmp_path, capsys):
     wiki = tmp_path / "lvcore_kb" / "Wiki"
     artifacts = tmp_path / "artifacts"
@@ -64,6 +69,10 @@ Find the EC2 instance ID, then open the matching CloudWatch log stream.
 ### RabbitMQ alerts
 
 RabbitMQ heartbeat alerts identify stalled consumers.
+
+## Related
+
+- [[lvcore-architecture]]
 """,
     )
 
@@ -71,7 +80,7 @@ RabbitMQ heartbeat alerts identify stalled consumers.
 
     output = json.loads(capsys.readouterr().out)
     assert output == {"articles": 1, "records": 3, "activated": 1, "unchanged": 0}
-    source_id = "lvcore--lvcore-observability"
+    source_id = _source_id(wiki)
     active_hash = read_active_hash(artifacts, source_type="markdown_knowledge_base", source_id=source_id)
     path = artifact_path(
         artifacts,
@@ -114,7 +123,7 @@ def test_cli_markdown_import_is_no_op_until_article_changes(tmp_path, capsys):
 
     assert first["activated"] == 1
     assert second["unchanged"] == 1
-    source_dir = artifacts / "markdown_knowledge_base" / "lvcore--lvcore-observability"
+    source_dir = artifacts / "markdown_knowledge_base" / _source_id(wiki)
     assert len(list(source_dir.glob("sha256-*.json"))) == 1
 
     article.write_text("# LVCore\n\n## Summary\n\nUpdated summary.\n")
@@ -136,8 +145,26 @@ def test_cli_markdown_import_skips_navigation_files(tmp_path, capsys):
 
     output = json.loads(capsys.readouterr().out)
     assert output["articles"] == 1
-    assert not (artifacts / "markdown_knowledge_base" / "lvcore--index").exists()
-    assert not (artifacts / "markdown_knowledge_base" / "lvcore--questions").exists()
+    assert not (artifacts / "markdown_knowledge_base" / _source_id(wiki, "INDEX.md")).exists()
+    assert not (artifacts / "markdown_knowledge_base" / _source_id(wiki, "QUESTIONS.md")).exists()
+
+
+def test_markdown_source_ids_do_not_collide_after_slugging(tmp_path, capsys):
+    wiki = tmp_path / "lvcore_kb" / "Wiki"
+    artifacts = tmp_path / "artifacts"
+    wiki.mkdir(parents=True)
+    first = wiki / "foo bar.md"
+    second = wiki / "foo-bar.md"
+    first.write_text("# First\n\n## Summary\n\nFirst article.\n")
+    second.write_text("# Second\n\n## Summary\n\nSecond article.\n")
+
+    run(_import_args(wiki, artifacts))
+
+    assert json.loads(capsys.readouterr().out)["articles"] == 2
+    assert markdown_source_id("lvcore", wiki, first) != markdown_source_id("lvcore", wiki, second)
+    source_dirs = list((artifacts / "markdown_knowledge_base").iterdir())
+    assert len(source_dirs) == 2
+    assert all((source_dir / "active.json").exists() for source_dir in source_dirs)
 
 
 def test_markdown_records_are_searchable_with_project_scope_and_citations(tmp_path, capsys):
@@ -170,7 +197,7 @@ def test_markdown_records_are_searchable_with_project_scope_and_citations(tmp_pa
 
     output = capsys.readouterr().out
     assert "RabbitMQ heartbeat alerts identify stalled consumers" in output
-    assert "markdown_knowledge_base/lvcore--lvcore-observability" in output
+    assert f"markdown_knowledge_base/{_source_id(wiki)}" in output
     assert "evidence rabbitmq-recovery" in output
     assert "Underlying sources:" not in output
 
@@ -186,7 +213,7 @@ def test_markdown_sections_split_at_paragraph_boundaries_to_fit_injection_budget
 
     run(_import_args(wiki, artifacts))
 
-    source_id = "lvcore--lvcore-observability"
+    source_id = _source_id(wiki)
     active_hash = read_active_hash(artifacts, source_type="markdown_knowledge_base", source_id=source_id)
     path = artifact_path(
         artifacts,
@@ -199,3 +226,14 @@ def test_markdown_sections_split_at_paragraph_boundaries_to_fit_injection_budget
     assert records[0]["evidence_location"]["identifier"] == "recovery/part-1"
     assert records[1]["evidence_location"]["identifier"] == "recovery/part-2"
     assert all(len(record["summary"]) <= 3_000 for record in records)
+
+
+def test_markdown_oversized_indivisible_paragraph_is_blocked(tmp_path, capsys):
+    wiki = tmp_path / "lvcore_kb" / "Wiki"
+    artifacts = tmp_path / "artifacts"
+    _write_article(wiki, "# LVCore\n\n## Generated token\n\n" + "x" * 3_001 + "\n")
+
+    exit_code = run(_import_args(wiki, artifacts))
+
+    assert exit_code == 2
+    assert "blocked" in capsys.readouterr().err
