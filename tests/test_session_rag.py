@@ -7,7 +7,7 @@ import pytest
 from session_rag.artifacts import artifact_path, find_record, job_status_path, read_active_hash
 from session_rag.cli import run
 from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry
-from session_rag.hook import handle_user_prompt
+from session_rag.hook import HookConfig, _INTRO, _estimate_tokens, _format_record, handle_user_prompt
 from session_rag.retrieval import search
 
 from conftest import make_record
@@ -585,3 +585,189 @@ def test_forget_purges_record_ids_from_retrieval_trace_log(tmp_path, capsys):
     run(["forget", "session-123", "--artifacts", str(artifacts_dir), "--database", str(database)])
 
     assert record_id not in trace_log.read_text()
+
+
+class SlowEmbedder:
+    dimensions = 2
+    model_name = "slow-test"
+
+    def embed(self, texts):
+        import time
+
+        time.sleep(0.3)
+        return [[0.0, 0.0] for _ in texts]
+
+
+class RaisingEmbedder:
+    dimensions = 2
+    model_name = "raising-test"
+
+    def embed(self, texts):
+        raise RuntimeError("embedding backend unavailable")
+
+
+def test_hook_fails_open_on_slow_retrieval_timeout(tmp_path):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    _extract_and_activate(artifacts_dir, transcript, "hi", question="Q", summary="S")
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], KeywordEmbedder())
+
+    response = handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "hi"},
+        database,
+        artifacts_dir,
+        SlowEmbedder(),
+        config=HookConfig(retrieval_timeout_ms=10),
+    )
+
+    assert response == {}
+    metrics = [json.loads(line) for line in (artifacts_dir / "hook_metrics.jsonl").read_text().splitlines()]
+    assert metrics[-1]["outcome"] == "timeout"
+    assert "prompt" not in json.dumps(metrics[-1])
+
+
+def test_hook_fails_open_on_retrieval_error(tmp_path):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    _extract_and_activate(artifacts_dir, transcript, "hi", question="Q", summary="S")
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], KeywordEmbedder())
+
+    response = handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "hi"}, database, artifacts_dir, RaisingEmbedder()
+    )
+
+    assert response == {}
+    metrics = [json.loads(line) for line in (artifacts_dir / "hook_metrics.jsonl").read_text().splitlines()]
+    assert metrics[-1]["outcome"] == "error"
+
+
+def test_hook_records_metric_without_prompt_text_on_success(tmp_path):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    _extract_and_activate(artifacts_dir, transcript, "why did rabbitmq reconnect", question="Q", summary="RabbitMQ heartbeat")
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "a secret prompt about rabbitmq"}, database, artifacts_dir, embedder
+    )
+
+    log_text = (artifacts_dir / "hook_metrics.jsonl").read_text()
+    assert "secret prompt" not in log_text
+    last = json.loads(log_text.splitlines()[-1])
+    assert last["outcome"] == "ok"
+    assert "latency_ms" in last
+    assert last["result_count"] == 1
+
+
+def test_hook_never_injects_more_than_max_injected_records(tmp_path):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    embedder = KeywordEmbedder()
+    for i in range(5):
+        transcript = tmp_path / f"session-{i}.jsonl"
+        _extract_and_activate(artifacts_dir, transcript, "rabbitmq", question=f"Q{i}", summary="rabbitmq heartbeat")
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    response = handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "rabbitmq"},
+        database,
+        artifacts_dir,
+        embedder,
+        config=HookConfig(max_injected_records=3, max_injected_tokens=100_000),
+    )
+
+    context = response["hookSpecificOutput"]["additionalContext"]
+    assert sum(context.count(f"Q{i}") for i in range(5)) <= 3
+
+
+def test_hook_omits_whole_records_rather_than_truncating_for_token_budget(tmp_path):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    embedder = KeywordEmbedder()
+    long_summary = "rabbitmq " + ("word " * 20)
+    for i in range(3):
+        transcript = tmp_path / f"session-{i}.jsonl"
+        _extract_and_activate(artifacts_dir, transcript, "rabbitmq", question=f"Q{i}", summary=long_summary)
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    # Size the budget precisely: room for the intro plus exactly one record,
+    # not two — using the module's own token estimate so this isn't a guess.
+    full_response, _trace = search(database, artifacts_dir, "rabbitmq", embedder)
+    one_record_tokens = _estimate_tokens(_format_record(1, full_response[0]))
+    budget = _estimate_tokens(_INTRO) + one_record_tokens + 1
+
+    response = handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "rabbitmq"},
+        database,
+        artifacts_dir,
+        embedder,
+        config=HookConfig(max_injected_records=3, max_injected_tokens=budget),
+    )
+
+    context = response["hookSpecificOutput"]["additionalContext"]
+    included = sum(context.count(f"Q{i}") for i in range(3))
+    assert included == 1
+    # Whichever record made it in is whole — the long summary isn't cut mid-word.
+    assert long_summary.strip() in context
+
+
+def test_hook_config_overridable_via_env(monkeypatch):
+    monkeypatch.setenv("SESSION_RAG_RETRIEVAL_TIMEOUT_MS", "9999")
+    monkeypatch.setenv("SESSION_RAG_MAX_INJECTED_TOKENS", "42")
+    monkeypatch.setenv("SESSION_RAG_MAX_INJECTED_RECORDS", "1")
+
+    config = HookConfig.from_env()
+
+    assert config.retrieval_timeout_ms == 9999
+    assert config.max_injected_tokens == 42
+    assert config.max_injected_records == 1
+
+
+def test_hook_timeout_thread_is_daemon_and_does_not_block_process_exit(tmp_path):
+    import threading
+
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    _extract_and_activate(artifacts_dir, transcript, "hi", question="Q", summary="S")
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], KeywordEmbedder())
+    before = {t.ident for t in threading.enumerate()}
+
+    handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "hi"},
+        database,
+        artifacts_dir,
+        SlowEmbedder(),
+        config=HookConfig(retrieval_timeout_ms=10),
+    )
+
+    leftover = [t for t in threading.enumerate() if t.ident not in before]
+    # The abandoned search() thread (if still alive) must be a daemon —
+    # never a plain executor thread that would block interpreter exit.
+    assert all(t.daemon for t in leftover)
+
+
+def test_hook_layers_max_injected_records_on_top_of_env_tuned_retrieval_config(tmp_path, monkeypatch):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    # Neither term is "rabbitmq"/"postgres", so KeywordEmbedder gives both
+    # query and text the same [0.0, 0.0] vector (distance 0) with no shared
+    # substring — qualifies by default (ceiling 1.0), excluded once an
+    # operator-tuned env var makes the floor impossibly strict.
+    _extract_and_activate(artifacts_dir, transcript, "unrelated", question="Q", summary="totally unrelated content")
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    monkeypatch.setenv("SESSION_RAG_VECTOR_DISTANCE_CEILING", "-1")
+    monkeypatch.setenv("SESSION_RAG_LEXICAL_SCORE_FLOOR", "1000000")
+
+    response = handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "zzz nothing shared"}, database, artifacts_dir, embedder
+    )
+
+    assert response == {}
