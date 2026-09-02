@@ -2,7 +2,7 @@
 
 **Status:** Implemented. v1 acceptance criteria are complete — see closed [issue #1](https://github.com/ianhandley-lvt/session-rag/issues/1) and merged PR #19.<br>
 **Decided:** 2026-09-01 · **Implemented:** 2026-09-02<br>
-**Scope:** Local Claude Code session knowledge for one operator on one Mac
+**Scope:** Local Claude Code session and curated Markdown knowledge for one operator on one Mac
 
 This is the readable, consolidated statement of the agreed v1 design. For the original pre-implementation framing and the open questions this document answers, see [`design-brief.md`](design-brief.md) (historical). For canonical domain vocabulary, see [`CONTEXT.md`](../CONTEXT.md). For the rationale behind specific hard-to-reverse decisions, see the ADRs linked throughout.
 
@@ -12,9 +12,9 @@ Session RAG turns useful knowledge created during Claude Code sessions into dura
 
 The v1 pipeline will:
 
-1. Read selected local Claude Code sessions.
+1. Read selected local Claude Code sessions or curated Markdown Wiki articles.
 2. Sanitize each session before sending it to the configured extraction provider.
-3. Use Cursor initially to extract semantic Knowledge Episodes.
+3. Use Cursor for noisy conversations and deterministic section parsing for already-curated Markdown knowledge.
 4. Validate the result and attach trusted provenance in application code.
 5. Persist an immutable Extraction Artifact before indexing anything.
 6. Build a rebuildable hybrid semantic and exact-text index in LanceDB.
@@ -405,6 +405,8 @@ The following are intentionally outside v1 or wait for evidence:
 - automatic extractor-provider fallback
 - a durable do-not-reingest exclusion list
 - Notion and other source adapters
+
+The deterministic `markdown_knowledge_base` source adapter is implemented; the deferred item above refers to additional external source systems.
 
 Each should be introduced in response to a demonstrated requirement or when the relevant second source/provider exists.
 

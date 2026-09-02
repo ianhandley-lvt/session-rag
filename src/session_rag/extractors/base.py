@@ -12,7 +12,7 @@ ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1
 
 
 TemporalScope = Literal["durable", "time_sensitive"]
-SourceType = Literal["claude_session"]
+SourceType = Literal["claude_session", "markdown_knowledge_base"]
 
 
 class Attribution(BaseModel):
@@ -99,6 +99,8 @@ class StructuredRecord(ExtractedKnowledge):
     operator_id: ShortText
     project: ProjectProvenance | None = None
     prompt_version: int
+    document_status: ShortText | None = None
+    source_references: list[ShortText] = Field(default_factory=list, max_length=100)
     # Overrides ExtractedKnowledge.evidence_location (a bare model-proposed
     # str) with the application-resolved EvidenceLocation object — same
     # field name as the draft, reprocessed by application code before a

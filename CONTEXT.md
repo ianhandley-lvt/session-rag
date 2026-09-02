@@ -13,8 +13,12 @@ The validated, schema-checked, provenance-attached persisted representation of o
 _Avoid_: Episode (when the persisted/validated artifact specifically is meant, not the underlying real-world unit), record (ambiguous alone)
 
 **Source Type**:
-Immutable provenance category of an Episode Record's origin — `claude_session`, `adr`, `notion_page`, `external_doc`, etc. Set once at extraction time from the source adapter, never changes for a given record.
+Immutable provenance category of an Episode Record's origin — `claude_session`, `markdown_knowledge_base`, `adr`, `notion_page`, `external_doc`, etc. Set once at extraction time from the source adapter, never changes for a given record.
 _Avoid_: Authority (source type says where evidence came from, not how much to trust it)
+
+**Markdown Knowledge Base**:
+A curated collection of Markdown articles that already contains synthesized knowledge and source citations. It enters Session RAG through deterministic heading/paragraph parsing rather than an LLM extractor: each article is one source revision, and its meaningful sections become Episode Records. Navigation files are not evidence, and the knowledge base's RAW folder remains provenance rather than a second copy in the retrieval index.
+_Avoid_: Transcript (the content is already authored knowledge), raw-document chunking (section boundaries carry meaning), re-extraction
 
 **Verification Status**:
 Mutable lifecycle state of one Episode Record — `unreviewed`, `verified`, `rejected`, `superseded`. Changes after extraction, independent of source type.

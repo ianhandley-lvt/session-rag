@@ -10,6 +10,7 @@ from .embeddings import FastEmbedder
 from .extractors import create_extractor
 from .extractors.base import KnowledgeExtractor
 from .hook import format_context, handle_user_prompt
+from .markdown_kb import MarkdownKnowledgeBaseExtractor, markdown_articles, markdown_source_id
 from .overlay import (
     InvalidTransition,
     SupersedeRequiresReplacement,
@@ -53,6 +54,14 @@ def parser() -> argparse.ArgumentParser:
     ingest = commands.add_parser("ingest")
     ingest.add_argument("--artifacts", type=Path, required=True)
     ingest.add_argument("--database", type=Path, required=True)
+    markdown = commands.add_parser("import-markdown-kb")
+    markdown.add_argument("wiki_dir", type=Path)
+    markdown.add_argument("--knowledge-base-id", required=True)
+    markdown.add_argument("--project-id", required=True)
+    markdown.add_argument("--project-root")
+    markdown.add_argument("--operator-id")
+    markdown.add_argument("--temporal-scope", choices=["durable", "time_sensitive"], default="time_sensitive")
+    markdown.add_argument("--artifacts", type=Path, required=True)
     extract = commands.add_parser("extract-session")
     extract.add_argument("transcript", type=Path)
     extract.add_argument("--artifacts", type=Path, required=True)
@@ -116,6 +125,42 @@ def run(
         records = filter_retrievable(args.artifacts, load_active_episode_records(args.artifacts))
         count = index_episode_records(args.database, records, selected_embedder)
         print(f"Indexed {count} episode records in {args.database}")
+    elif args.command == "import-markdown-kb":
+        if not args.wiki_dir.is_dir():
+            print(f"not a directory: {args.wiki_dir}", file=sys.stderr)
+            return 1
+        try:
+            markdown_extractor = MarkdownKnowledgeBaseExtractor(
+                knowledge_base_id=args.knowledge_base_id,
+                project_id=args.project_id,
+                project_root=args.project_root,
+                operator_id=args.operator_id,
+                temporal_scope=args.temporal_scope,
+            )
+        except ValueError as error:
+            print(f"configuration error: {error}", file=sys.stderr)
+            return 3
+
+        articles = markdown_articles(args.wiki_dir)
+        activated = 0
+        unchanged = 0
+        record_count = 0
+        for article in articles:
+            source_id = markdown_source_id(args.knowledge_base_id, args.wiki_dir, article)
+            outcome = run_extraction(
+                markdown_extractor,
+                article,
+                args.artifacts,
+                source_type="markdown_knowledge_base",
+                source_id=source_id,
+            )
+            if outcome.status == "activated":
+                activated += 1
+            elif outcome.status == "no_op":
+                unchanged += 1
+            if outcome.artifact_path:
+                record_count += len(json.loads(outcome.artifact_path.read_text())["episode_records"])
+        print(json.dumps({"articles": len(articles), "records": record_count, "activated": activated, "unchanged": unchanged}))
     elif args.command == "extract-session":
         try:
             selected_extractor = extractor or create_extractor(

@@ -63,6 +63,8 @@ def index_episode_records(database: Path, records: list[dict], embedder: Embedde
             # Empty string for "no location", consistent with this file's
             # other optional-field conventions (project_id, temporal_scope).
             "evidence_location_id": (record.get("evidence_location") or {}).get("identifier") or "",
+            "document_status": record.get("document_status") or "",
+            "source_references": record.get("source_references") or [],
             "embedding_model": embedder.model_name,
             "vector": vector,
         }

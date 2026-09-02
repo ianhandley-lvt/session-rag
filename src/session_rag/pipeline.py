@@ -71,12 +71,13 @@ def run_extraction(
     artifacts_root: Path,
     *,
     source_type: SourceType = "claude_session",
+    source_id: str | None = None,
 ) -> ExtractionOutcome:
     """Extract, persist, and activate one source revision — or record why it
     didn't happen. Never writes a partial artifact and never moves the
     Active Revision pointer except after a fully validated extraction."""
 
-    source_id = transcript.stem
+    source_id = source_id or transcript.stem
     hash_value = source_hash(transcript)
     current_active = read_active_hash(artifacts_root, source_type=source_type, source_id=source_id)
     existing_path = artifact_path(artifacts_root, source_type=source_type, source_id=source_id, hash_value=hash_value)
