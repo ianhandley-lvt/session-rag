@@ -82,17 +82,25 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _forget_sources(artifacts_root: Path, database: Path, source_ids: list[str]) -> int:
+def _forget_sources(artifacts_root: Path, database: Path, source_ids: list[str], *, project_id: str | None = None) -> int:
     """Run the full forget sequence (artifact, overlay, trace, index) for
     each source — shared by single-source and project-wide forget so the
-    erasure guarantee is enforced identically either way."""
+    erasure guarantee is enforced identically either way.
+
+    LanceDB only ever holds rows from a source's *active* revision, so its
+    rows are purged only when this source's active revision was actually
+    removed — never unconditionally by source_id alone. Otherwise, for a
+    source whose revision history spans more than one project, forgetting
+    one project could hard-delete another project's still-active, currently
+    indexed rows for that same source_id — an isolation violation."""
 
     total = 0
     for source_id in source_ids:
-        record_ids = forget_source(artifacts_root, source_id)
+        record_ids, active_revision_removed = forget_source(artifacts_root, source_id, project_id=project_id)
         forget_records(artifacts_root, record_ids)
         purge_traces(artifacts_root, set(record_ids))
-        delete_by_source_id(database, source_id)
+        if project_id is None or active_revision_removed:
+            delete_by_source_id(database, source_id)
         total += len(record_ids)
     return total
 
@@ -204,10 +212,12 @@ def run(
         if args.source_id:
             source_ids = [args.source_id]
             label = f"source {args.source_id}"
+            project_id = None
         else:
             source_ids = find_sources_by_project(args.artifacts, args.project)
             label = f"project {args.project}"
-        total_records = _forget_sources(args.artifacts, args.database, source_ids)
+            project_id = args.project
+        total_records = _forget_sources(args.artifacts, args.database, source_ids, project_id=project_id)
         # Terminal-only, one-time — never written to a file, matching the
         # erasure guarantee (no record of the deletion itself is retained).
         print(f"forgot {total_records} record(s) across {len(source_ids)} source(s) for {label}")

@@ -672,6 +672,51 @@ def test_hook_timeout_bounds_embedder_construction_not_just_search(tmp_path):
     assert metrics[-1]["outcome"] == "timeout"
 
 
+def test_hook_timeout_bounds_formatting_not_just_construction_and_search(tmp_path, monkeypatch):
+    import time
+
+    import session_rag.hook as hook_module
+
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    _extract_and_activate(artifacts_dir, transcript, "hi", question="Q", summary="S")
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    real_format = hook_module._build_context_within_budget
+
+    def slow_format(results, max_tokens):
+        time.sleep(0.3)
+        return real_format(results, max_tokens)
+
+    # Formatting runs after search returns, so it can only be proven bounded
+    # by faking it slow — nothing in the format step itself is naturally
+    # slow enough to demonstrate the gap otherwise.
+    monkeypatch.setattr(hook_module, "_build_context_within_budget", slow_format)
+
+    started = time.monotonic()
+    response = handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "hi"},
+        database,
+        artifacts_dir,
+        embedder,
+        # Must actually surface a candidate to reach the formatting step —
+        # global_scope=True so this isn't defeated by the unscoped-record
+        # scope gate (Fix 3) before formatting is ever attempted.
+        scope=RetrievalScope(global_scope=True),
+        config=HookConfig(retrieval_timeout_ms=10),
+    )
+    elapsed_ms = (time.monotonic() - started) * 1000
+
+    assert response == {}
+    # Bounded by the configured timeout, not the slow formatting step —
+    # proves formatting runs inside the timed path, not after it.
+    assert elapsed_ms < 300
+    metrics = [json.loads(line) for line in (artifacts_dir / "hook_metrics.jsonl").read_text().splitlines()]
+    assert metrics[-1]["outcome"] == "timeout"
+
+
 def test_hook_fails_open_on_retrieval_error(tmp_path):
     transcript = tmp_path / "session-123.jsonl"
     artifacts_dir = tmp_path / "artifacts"
@@ -917,6 +962,40 @@ def test_forget_project_removes_lancedb_rows_and_traces_but_not_other_projects(t
     run(["forget", "--project", "project-a", "--artifacts", str(artifacts_dir), "--database", str(database)])
 
     assert record_a not in trace_log.read_text()
+    capsys.readouterr()
+    run(["search", "project-b", "--database", str(database), "--artifacts", str(artifacts_dir), "--global-scope"], embedder)
+    output = capsys.readouterr().out
+    assert "SB project-b" in output
+
+
+def test_forget_project_does_not_delete_another_projects_active_revision_of_the_same_source(tmp_path, capsys):
+    """A source_id's revision history can span more than one project if the
+    operator's project config changes between extractions of the same
+    transcript. Forgetting the older project must not delete the newer
+    project's now-active revision for that same source_id, and must not
+    hard-delete its still-valid LanceDB rows either — isolation has to hold
+    within one source, not just across separate sources."""
+
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript = tmp_path / "session-a.jsonl"
+
+    record_a = _extract_with_project(artifacts_dir, transcript, "v1 content", "QA", "SA project-a", "project-a", capsys)
+    # Re-extract the SAME transcript (source_id stays "session-a") under a
+    # different project — this becomes the new active revision.
+    record_b = _extract_with_project(artifacts_dir, transcript, "v2 content", "QB", "SB project-b", "project-b", capsys)
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    exit_code = run(["forget", "--project", "project-a", "--artifacts", str(artifacts_dir), "--database", str(database)])
+
+    assert exit_code == 0
+    # project-b's now-active revision for this same source_id survives.
+    assert (artifacts_dir / "claude_session" / "session-a").exists()
+    assert find_record(artifacts_dir, record_b) is not None
+    # project-a's superseded revision is gone.
+    assert find_record(artifacts_dir, record_a) is None
+
     capsys.readouterr()
     run(["search", "project-b", "--database", str(database), "--artifacts", str(artifacts_dir), "--global-scope"], embedder)
     output = capsys.readouterr().out

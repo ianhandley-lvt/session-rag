@@ -211,17 +211,52 @@ def find_sources_by_project(root: Path, project_id: str) -> list[str]:
     return matches
 
 
-def forget_source(root: Path, source_id: str) -> list[str]:
-    """Hard-delete every artifact revision (all hashes, active pointer, job
-    status) for one source, across whichever source_type it lives under.
-    Returns the record ids that existed, so callers can also purge Record
-    State Overlay entries — forget must leave no trace anywhere."""
+def forget_source(root: Path, source_id: str, *, project_id: str | None = None) -> tuple[list[str], bool]:
+    """Hard-delete artifact revisions for one source, across whichever
+    source_type it lives under. Returns (record_ids, active_revision_removed)
+    — record_ids so callers can also purge Record State Overlay and
+    Retrieval Trace entries, active_revision_removed so callers know whether
+    the source's indexed LanceDB rows are now stale and must be purged too.
+
+    With project_id=None (single-source forget), every revision is deleted
+    unconditionally — forget must leave no trace anywhere. With project_id
+    set (project-wide forget), only revisions whose records carry that
+    Project Provenance are deleted: a source_id's revision history can in
+    principle span more than one project (e.g. the same session transcript
+    re-extracted after the operator's project config changed), and
+    forgetting one project must never delete another project's still-active
+    revision for that source — isolation must hold even in that edge case.
+    """
 
     record_ids: list[str] = []
-    for _, source_dir in _iter_source_dirs(root):
+    active_revision_removed = False
+    for source_type, source_dir in _iter_source_dirs(root):
         if source_dir.name != source_id:
             continue
-        for envelope in _iter_source_envelopes(source_dir):
-            record_ids.extend(record["id"] for record in envelope["episode_records"])
-        shutil.rmtree(source_dir)
-    return record_ids
+
+        active_hash = read_active_hash(root, source_type=source_type, source_id=source_id)
+        remaining_hashes: list[str] = []
+        for artifact_file in sorted(source_dir.glob("sha256-*.json")):
+            envelope = read_artifact(artifact_file)
+            matches = project_id is None or any(
+                (record.get("project") or {}).get("project_id") == project_id
+                for record in envelope["episode_records"]
+            )
+            if matches:
+                record_ids.extend(record["id"] for record in envelope["episode_records"])
+                artifact_file.unlink()
+                if envelope["source_hash"] == active_hash:
+                    active_revision_removed = True
+            else:
+                remaining_hashes.append(envelope["source_hash"])
+
+        if remaining_hashes:
+            # Other-project revisions survive — clear the active pointer
+            # only if the revision it names was actually deleted; job
+            # status isn't attributable to a single project, so it's left
+            # alone whenever any revision survives.
+            if active_hash not in remaining_hashes:
+                active_revision_path(root, source_type=source_type, source_id=source_id).unlink(missing_ok=True)
+        else:
+            shutil.rmtree(source_dir)
+    return record_ids, active_revision_removed

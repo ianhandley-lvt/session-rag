@@ -114,19 +114,24 @@ def _run_with_timeout(timeout_seconds: float, fn, *args, **kwargs):
     return box["value"]
 
 
-def _build_embedder_and_search(
+def _build_embedder_search_and_format(
     embedder_factory: Callable[[], Embedder],
     database: Path,
     artifacts_root: Path,
     query: str,
     config: RetrievalConfig,
     scope: RetrievalScope | None,
-):
-    """Constructs the embedder and runs search() as one unit, so both fall
-    inside the same timed daemon thread (see _run_with_timeout)."""
+    max_injected_tokens: int,
+) -> tuple[list[dict], str | None]:
+    """Constructs the embedder, searches, and formats the injected context as
+    one unit inside the same timed daemon thread (see _run_with_timeout) —
+    retrieval_timeout_ms must bound embedder initialization, query embedding,
+    search, ranking, AND formatting, not just the search() call."""
 
     embedder = embedder_factory()
-    return search(database, artifacts_root, query, embedder, config, scope)
+    results, _trace = search(database, artifacts_root, query, embedder, config, scope)
+    context = _build_context_within_budget(results, max_injected_tokens) if results else None
+    return results, context
 
 
 def _record_metric(artifacts_root: Path, *, latency_ms: float, outcome: str, result_count: int) -> None:
@@ -158,9 +163,9 @@ def handle_user_prompt(
     # Exactly one of embedder/embedder_factory is expected: embedder for
     # callers (mostly tests) that already hold a constructed instance,
     # embedder_factory for real hook invocations, where construction itself
-    # must fall inside retrieval_timeout_ms (see _build_embedder_and_search).
-    # A pre-built embedder is wrapped as a trivial factory so both paths run
-    # through the same timed call.
+    # must fall inside retrieval_timeout_ms (see
+    # _build_embedder_search_and_format). A pre-built embedder is wrapped as
+    # a trivial factory so both paths run through the same timed call.
     if embedder is not None:
         resolved_factory = lambda: embedder  # noqa: E731
     elif embedder_factory is not None:
@@ -172,6 +177,7 @@ def handle_user_prompt(
     started = time.monotonic()
     prompt = event.get("prompt", "").strip()
     results: list[dict] = []
+    context: str | None = None
     outcome = "ok"
 
     if event.get("hook_event_name") != "UserPromptSubmit" or not prompt:
@@ -182,15 +188,16 @@ def handle_user_prompt(
         # back to dataclass defaults every hook call.
         retrieval_config = replace(RetrievalConfig.from_env(), max_results=config.max_injected_records)
         try:
-            results, _trace = _run_with_timeout(
+            results, context = _run_with_timeout(
                 config.retrieval_timeout_ms / 1000,
-                _build_embedder_and_search,
+                _build_embedder_search_and_format,
                 resolved_factory,
                 database,
                 artifacts_root,
                 prompt,
                 retrieval_config,
                 scope,
+                config.max_injected_tokens,
             )
         except _RetrievalTimeout:
             outcome = "timeout"
@@ -200,9 +207,6 @@ def handle_user_prompt(
     latency_ms = (time.monotonic() - started) * 1000
     _record_metric(artifacts_root, latency_ms=latency_ms, outcome=outcome, result_count=len(results))
 
-    if not results:
-        return {}
-    context = _build_context_within_budget(results, config.max_injected_tokens)
     if not context:
         return {}
     return {
