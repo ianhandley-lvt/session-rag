@@ -88,6 +88,21 @@ def supersede(root: Path, record_id: str, replacement_id: str | None) -> None:
     _transition(root, record_id, "superseded", superseded_by=replacement_id)
 
 
+def forget_records(root: Path, record_ids: list[str]) -> None:
+    """Purge these ids from the overlay entirely — part of forget's erasure
+    guarantee. Not an overlay entry itself; leaves nothing behind."""
+
+    if not record_ids:
+        return
+    overlay = _read_overlay(root)
+    changed = False
+    for record_id in record_ids:
+        if overlay.pop(record_id, None) is not None:
+            changed = True
+    if changed:
+        atomic_write_json(overlay_path(root), overlay)
+
+
 def filter_retrievable(root: Path, records: list[dict]) -> list[dict]:
     """Drop rejected/superseded records before they ever reach the index —
     excluded records still exist in their (immutable) artifact and remain

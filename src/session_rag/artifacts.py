@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -175,15 +176,38 @@ def load_active_episode_records(root: Path) -> list[dict]:
     return records
 
 
+def _iter_source_envelopes(source_dir: Path) -> Iterator[dict]:
+    """Every artifact envelope (any revision, active or not) in one source
+    directory — the shared scan `find_record` and `forget_source` both need."""
+
+    for artifact_file in sorted(source_dir.glob("sha256-*.json")):
+        yield read_artifact(artifact_file)
+
+
 def find_record(root: Path, record_id: str) -> dict | None:
     """Locate one Episode Record by its stable id, across every artifact —
     active or not. Verification/history commands take only a record id, so
     this is a full scan; the local corpus this targets makes that fine."""
 
     for _, source_dir in _iter_source_dirs(root):
-        for artifact_file in sorted(source_dir.glob("sha256-*.json")):
-            envelope = read_artifact(artifact_file)
+        for envelope in _iter_source_envelopes(source_dir):
             for record in envelope["episode_records"]:
                 if record["id"] == record_id:
                     return _denormalize(record, envelope)
     return None
+
+
+def forget_source(root: Path, source_id: str) -> list[str]:
+    """Hard-delete every artifact revision (all hashes, active pointer, job
+    status) for one source, across whichever source_type it lives under.
+    Returns the record ids that existed, so callers can also purge Record
+    State Overlay entries — forget must leave no trace anywhere."""
+
+    record_ids: list[str] = []
+    for _, source_dir in _iter_source_dirs(root):
+        if source_dir.name != source_id:
+            continue
+        for envelope in _iter_source_envelopes(source_dir):
+            record_ids.extend(record["id"] for record in envelope["episode_records"])
+        shutil.rmtree(source_dir)
+    return record_ids

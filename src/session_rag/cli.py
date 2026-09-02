@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from .artifacts import find_record, load_active_episode_records
+from .artifacts import find_record, forget_source, load_active_episode_records
 from .embeddings import FastEmbedder
 from .extractors import create_extractor
 from .extractors.base import KnowledgeExtractor
@@ -15,6 +15,7 @@ from .overlay import (
     SupersedeRequiresReplacement,
     UnknownReplacementRecord,
     filter_retrievable,
+    forget_records,
     read_state,
     reject,
     supersede,
@@ -22,8 +23,9 @@ from .overlay import (
 )
 from .pipeline import run_extraction
 from .retrieval import RetrievalScope
+from .retrieval import purge_traces
 from .retrieval import search as retrieval_search
-from .store import Embedder, index_episode_records
+from .store import Embedder, delete_by_source_id, index_episode_records
 
 
 def _add_record_command_args(subparser: argparse.ArgumentParser) -> None:
@@ -72,6 +74,10 @@ def parser() -> argparse.ArgumentParser:
     _add_record_command_args(supersede_cmd)
     supersede_cmd.add_argument("replacement_id")
     _add_record_command_args(commands.add_parser("history"))
+    forget_cmd = commands.add_parser("forget")
+    forget_cmd.add_argument("source_id")
+    forget_cmd.add_argument("--artifacts", type=Path, required=True)
+    forget_cmd.add_argument("--database", type=Path, required=True)
     return result
 
 
@@ -162,6 +168,14 @@ def run(
             print(f"error: {error}", file=sys.stderr)
             return 1
         print(f"{verb} {args.record_id}")
+    elif args.command == "forget":
+        record_ids = forget_source(args.artifacts, args.source_id)
+        forget_records(args.artifacts, record_ids)
+        purge_traces(args.artifacts, set(record_ids))
+        delete_by_source_id(args.database, args.source_id)
+        # Terminal-only, one-time — never written to a file, matching the
+        # erasure guarantee (no record of the deletion itself is retained).
+        print(f"forgot {len(record_ids)} record(s) for source {args.source_id}")
     return 0
 
 

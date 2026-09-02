@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
@@ -11,6 +12,8 @@ from .artifacts import read_active_hash
 from .jsonio import append_json_line
 from .overlay import EXCLUDED_FROM_SEARCH, read_state
 from .store import Embedder, TABLE_NAME
+
+TRACE_LOG_NAME = "retrieval_traces.jsonl"
 
 _ENV_PREFIX = "SESSION_RAG_"
 
@@ -259,6 +262,26 @@ def search(
     # posture the hook otherwise holds to.
     persisted_trace = {key: value for key, value in trace.items() if key != "query"}
     persisted_trace["logged_at"] = datetime.now(timezone.utc).isoformat()
-    append_json_line(artifacts_root / "retrieval_traces.jsonl", persisted_trace)
+    append_json_line(artifacts_root / TRACE_LOG_NAME, persisted_trace)
 
     return results, trace
+
+
+def purge_traces(artifacts_root: Path, record_ids: set[str]) -> None:
+    """Scrub these record ids from the persisted Retrieval Trace log — part
+    of forget's erasure guarantee. Rewrites each trace entry rather than
+    dropping it outright, since one search's trace can name records from
+    many sources, most of which aren't being forgotten."""
+
+    path = artifacts_root / TRACE_LOG_NAME
+    if not record_ids or not path.exists():
+        return
+    kept_lines = []
+    for line in path.read_text().splitlines():
+        if not line:
+            continue
+        entry = json.loads(line)
+        entry["candidates"] = [c for c in entry.get("candidates", []) if c.get("id") not in record_ids]
+        entry["returned_ids"] = [i for i in entry.get("returned_ids", []) if i not in record_ids]
+        kept_lines.append(json.dumps(entry))
+    path.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""))
