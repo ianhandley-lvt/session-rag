@@ -5,13 +5,28 @@ import json
 import sys
 from pathlib import Path
 
-from .artifacts import load_active_episode_records
+from .artifacts import find_record, load_active_episode_records
 from .embeddings import FastEmbedder
 from .extractors import create_extractor
 from .extractors.base import KnowledgeExtractor
 from .hook import format_context, handle_user_prompt
+from .overlay import (
+    InvalidTransition,
+    SupersedeRequiresReplacement,
+    UnknownReplacementRecord,
+    filter_retrievable,
+    read_state,
+    reject,
+    supersede,
+    verify,
+)
 from .pipeline import run_extraction
 from .store import Embedder, index_episode_records, search_episode_records
+
+
+def _add_record_command_args(subparser: argparse.ArgumentParser) -> None:
+    subparser.add_argument("record_id")
+    subparser.add_argument("--artifacts", type=Path, required=True)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -31,6 +46,12 @@ def parser() -> argparse.ArgumentParser:
     search.add_argument("--database", type=Path, required=True)
     hook = commands.add_parser("hook")
     hook.add_argument("--database", type=Path, required=True)
+    _add_record_command_args(commands.add_parser("verify"))
+    _add_record_command_args(commands.add_parser("reject"))
+    supersede_cmd = commands.add_parser("supersede")
+    _add_record_command_args(supersede_cmd)
+    supersede_cmd.add_argument("replacement_id")
+    _add_record_command_args(commands.add_parser("history"))
     return result
 
 
@@ -42,7 +63,7 @@ def run(
     args = parser().parse_args(arguments)
     if args.command == "ingest":
         selected_embedder = embedder or FastEmbedder()
-        records = load_active_episode_records(args.artifacts)
+        records = filter_retrievable(args.artifacts, load_active_episode_records(args.artifacts))
         count = index_episode_records(args.database, records, selected_embedder)
         print(f"Indexed {count} episode records in {args.database}")
     elif args.command == "extract-session":
@@ -95,6 +116,29 @@ def run(
             print(json.dumps(handle_user_prompt(event, args.database, selected_embedder)))
         except Exception:
             print("{}")
+    elif args.command in {"verify", "reject", "supersede", "history"}:
+        record = find_record(args.artifacts, args.record_id)
+        if record is None:
+            print(f"no such record: {args.record_id}", file=sys.stderr)
+            return 1
+
+        if args.command == "history":
+            state = read_state(args.artifacts, args.record_id)
+            print(json.dumps({**record, **state}, indent=2))
+            return 0
+
+        verb = {"verify": "verified", "reject": "rejected", "supersede": "superseded"}[args.command]
+        try:
+            if args.command == "verify":
+                verify(args.artifacts, args.record_id)
+            elif args.command == "reject":
+                reject(args.artifacts, args.record_id)
+            else:
+                supersede(args.artifacts, args.record_id, args.replacement_id)
+        except (InvalidTransition, SupersedeRequiresReplacement, UnknownReplacementRecord) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        print(f"{verb} {args.record_id}")
     return 0
 
 
