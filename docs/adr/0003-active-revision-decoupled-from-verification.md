@@ -1,0 +1,5 @@
+# Active Revision is a source-level pointer, decoupled from per-record Verification Status
+
+When a source's content changes (new hash), extraction produces a new immutable Extraction Artifact for that revision. We decided the *only* thing that changes automatically is which revision is eligible for normal retrieval (the Active Revision pointer, swapped atomically only after the new artifact fully extracts and validates — on failure, the previous revision stays active). No individual Episode Record's `verification_status` is ever changed by this process, even for records from the now-inactive revision.
+
+We rejected auto-marking old records `superseded` on re-extraction: `verification_status` transitions are manual-only by design (see CONTEXT.md — Verification Status), and the extraction pipeline changing a record's review state would be the pipeline claiming a human reviewed something it didn't. Old revisions and their records remain preserved for provenance/audit, reachable via explicit history lookup, just not surfaced in normal search. `ingest` prints an informational diff nudging the operator toward manual reconciliation, but performs none itself.

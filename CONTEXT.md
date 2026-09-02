@@ -28,7 +28,7 @@ _Avoid_: Episode kind, record type (those would classify *content*; this classif
 A ranking-time signal computed from source type, verification status, temporal scope, and recency — not a stored field on the record. Determines how much a piece of evidence should outrank another during retrieval.
 
 v1 policy: `rejected`/`superseded` excluded from normal retrieval (still reachable via explicit record/history lookup). Among retrievable records: `verified` + `durable` → no recency decay. `unreviewed` + `durable` → mild recency decay (an extraction-time `durable` label must not grant unreviewed content permanent ranking strength). `time_sensitive` (either verification status) → normal recency decay. Source-type weighting deferred until a second source type ships, with the policy versioned/configurable so ranking changes stay testable.
-_Avoid_: Storing this as a fixed enum on the record (rejected — see ADR once written); `working_session`/`verified_decision` as record-level values
+_Avoid_: Storing this as a fixed enum on the record (rejected — see [ADR-0002](docs/adr/0002-authority-is-computed-not-stored.md)); `working_session`/`verified_decision` as record-level values
 
 **Record State Overlay**:
 Durable, mutable storage — separate from any Extraction Artifact — holding `verification_status` and supersession links, keyed by each Episode Record's stable ID. Exists because artifacts are immutable and verification is not: a `verify`/`reject`/`supersede` command edits the overlay, never the artifact. Retrieval reads an Episode Record's content from its artifact and its lifecycle state from the overlay. Must survive a LanceDB rebuild — proof it isn't merely baked into derived index rows.
@@ -39,7 +39,7 @@ The outcome of one extraction attempt on a source revision — `pending_retry` (
 _Avoid_: Verification Status (per-record lifecycle, not per-job outcome)
 
 **Retrieval Scope**:
-A local boundary — not a permission system — limiting a query to the current `project_id` by default, using trusted Project Provenance, to prevent accidental disclosure between unrelated workspaces on one machine. Cross-project or global-scope retrieval requires explicit configuration; the hook passes the trusted project context itself, and the submitted prompt text can never choose or override scope (closes an injection path — retrieved evidence must stay data, never a lever to widen its own future retrieval).
+A local boundary — not a permission system — limiting a query to the current `project_id` by default, using trusted Project Provenance, to prevent accidental disclosure between unrelated workspaces on one machine. Cross-project or global-scope retrieval requires explicit configuration; the hook passes the trusted project context itself, and the submitted prompt text can never choose or override scope (closes an injection path — retrieved evidence must stay data, never a lever to widen its own future retrieval). See [ADR-0004](docs/adr/0004-prompt-cannot-widen-retrieval-scope.md).
 _Avoid_: Permission, ACL, access control (those are the deferred, real multi-source authorization problem — this is narrower)
 
 **Project Provenance**:
@@ -59,11 +59,11 @@ A record of one retrieval's raw vector and lexical scores, which candidates qual
 _Avoid_: Log (implies generic operational logging; this is structured data the evaluation approach specifically consumes)
 
 **Active Revision**:
-The one source revision (by source hash) whose Episode Records are eligible for normal retrieval, per source ID. Set atomically only after a new Extraction Artifact is fully extracted and validated; if extraction/validation fails, the previous revision stays active. Ineligibility from a non-active revision is a source-level fact, distinct from and does not alter any individual record's Verification Status.
+The one source revision (by source hash) whose Episode Records are eligible for normal retrieval, per source ID. Set atomically only after a new Extraction Artifact is fully extracted and validated; if extraction/validation fails, the previous revision stays active. Ineligibility from a non-active revision is a source-level fact, distinct from and does not alter any individual record's Verification Status. See [ADR-0003](docs/adr/0003-active-revision-decoupled-from-verification.md).
 _Avoid_: Latest revision (implies mere recency, not the atomic all-or-nothing swap), current version
 
 **Extraction Artifact**:
-The versioned, immutable JSON envelope holding all Episode Records produced from one source revision — keyed by source ID and source hash so re-extraction never destroys a prior revision. The durable, replayable input to the LanceDB index; LanceDB itself stays a rebuildable derived index, never the system of record.
+The versioned, immutable JSON envelope holding all Episode Records produced from one source revision — keyed by source ID and source hash so re-extraction never destroys a prior revision. The durable, replayable input to the LanceDB index; LanceDB itself stays a rebuildable derived index, never the system of record. See [ADR-0001](docs/adr/0001-extraction-artifacts-are-the-system-of-record.md).
 _Avoid_: Extraction result, cache (implies disposable; this is durable), vector row, index row
 
 **Evidence Location**:
