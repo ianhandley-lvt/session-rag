@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from session_rag.artifacts import artifact_path, job_status_path, read_active_hash
+from session_rag.artifacts import artifact_path, find_record, job_status_path, read_active_hash
 from session_rag.cli import run
 from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry
 from session_rag.hook import handle_user_prompt
@@ -516,3 +516,72 @@ def test_supersession_link_survives_lancedb_rebuild(tmp_path, capsys):
 
     assert history["verification_status"] == "superseded"
     assert history["superseded_by"] == new_id
+
+
+def test_forget_removes_artifacts_overlay_and_index_rows(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript = tmp_path / "session-123.jsonl"
+    record_id = _extract_and_get_record_id(artifacts_dir, transcript, "hi", "Q", "S", capsys)
+    run(["reject", record_id, "--artifacts", str(artifacts_dir)])
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    exit_code = run(["forget", "session-123", "--artifacts", str(artifacts_dir), "--database", str(database)])
+
+    assert exit_code == 0
+    assert not (artifacts_dir / "claude_session" / "session-123").exists()
+    overlay_path = artifacts_dir / "overlay.json"
+    if overlay_path.exists():
+        assert record_id not in overlay_path.read_text()
+    assert find_record(artifacts_dir, record_id) is None
+
+
+def test_forget_prints_summary_only_to_terminal_no_file_retains_source(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript = tmp_path / "secret-session.jsonl"
+    record_id = _extract_and_get_record_id(artifacts_dir, transcript, "hi", "Q", "S", capsys)
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder=KeywordEmbedder())
+    capsys.readouterr()
+
+    run(["forget", "secret-session", "--artifacts", str(artifacts_dir), "--database", str(database)])
+    output = capsys.readouterr()
+
+    assert "secret-session" in output.out  # terminal display is fine — ephemeral
+    # No file anywhere under artifacts/ mentions the forgotten source id.
+    for path in artifacts_dir.rglob("*"):
+        if path.is_file():
+            assert "secret-session" not in path.read_text()
+
+
+def test_forget_does_not_block_reingestion_of_same_source(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript = tmp_path / "session-123.jsonl"
+    _extract_and_get_record_id(artifacts_dir, transcript, "hi", "Q", "S", capsys)
+    run(["forget", "session-123", "--artifacts", str(artifacts_dir), "--database", str(database)])
+
+    record = make_record(question="Q2", summary="S2", source=str(transcript.resolve()), source_session_id="session-123")
+    exit_code = run(
+        ["extract-session", str(transcript), "--artifacts", str(artifacts_dir)], extractor=FakeExtractor([record])
+    )
+
+    assert exit_code == 0
+    assert (artifacts_dir / "claude_session" / "session-123").exists()
+
+
+def test_forget_purges_record_ids_from_retrieval_trace_log(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript = tmp_path / "session-123.jsonl"
+    record_id = _extract_and_get_record_id(artifacts_dir, transcript, "rabbitmq heartbeat", "Q", "S", capsys)
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+    run(["search", "rabbitmq", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder)
+    trace_log = artifacts_dir / "retrieval_traces.jsonl"
+    assert record_id in trace_log.read_text()
+
+    run(["forget", "session-123", "--artifacts", str(artifacts_dir), "--database", str(database)])
+
+    assert record_id not in trace_log.read_text()

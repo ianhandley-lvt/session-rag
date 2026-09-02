@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -64,3 +65,23 @@ def index_episode_records(database: Path, records: list[dict], embedder: Embedde
     table = connection.create_table(TABLE_NAME, data=rows, mode="overwrite")
     table.create_fts_index("text", replace=True)
     return len(rows)
+
+
+def delete_by_source_id(database: Path, source_id: str) -> None:
+    """Hard-delete every indexed row (and its cached embedding) for one
+    source — part of `forget`'s erasure guarantee. `delete()` alone only
+    marks rows removed in a new table version; Lance keeps prior versions'
+    data files on disk until cleaned up, so a deleted embedding could still
+    be present in an old, time-travelable version — optimize()'s prune step
+    forces that immediately rather than leaving a real hard-delete pending
+    on a future compaction."""
+
+    if not database.exists():
+        return
+    connection = lancedb.connect(database)
+    if TABLE_NAME not in connection.table_names():
+        return
+    table = connection.open_table(TABLE_NAME)
+    escaped = source_id.replace("'", "''")
+    table.delete(f"source_id = '{escaped}'")
+    table.optimize(cleanup_older_than=timedelta(0), delete_unverified=True)
