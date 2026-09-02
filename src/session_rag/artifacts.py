@@ -211,17 +211,38 @@ def find_record(root: Path, record_id: str) -> dict | None:
     return None
 
 
+def _record_project_id(record: dict) -> str | None:
+    """A record's Project Provenance project_id, or None — the one place
+    that shape is read, shared by find_sources_by_project and
+    forget_source so both apply the exact same matching rule."""
+
+    return (record.get("project") or {}).get("project_id")
+
+
 def find_sources_by_project(root: Path, project_id: str) -> list[str]:
-    """Every source_id with at least one Episode Record (in any revision)
-    whose Project Provenance matches project_id. Used by project-wide
-    forget to discover which sources to erase."""
+    """Every source_id with a trace of project_id: at least one Episode
+    Record (in any revision) whose Project Provenance matches, OR — with no
+    successful revision at all — an Extraction Job Status attempted under
+    project_id. A failed/blocked/pending_retry attempt never produces an
+    Episode Record, so job status is the only place its project attribution
+    can live; without checking it here, a source whose only trace of a
+    project is a failed attempt would be invisible to project-wide forget,
+    leaving that attempt's hash/reason/metadata behind forever. Used by
+    project-wide forget to discover which sources to erase."""
 
     matches: list[str] = []
-    for _, source_dir in _iter_source_dirs(root):
-        for envelope in _iter_source_envelopes(source_dir):
-            if any((record.get("project") or {}).get("project_id") == project_id for record in envelope["episode_records"]):
-                matches.append(source_dir.name)
-                break
+    for source_type, source_dir in _iter_source_dirs(root):
+        has_matching_record = any(
+            _record_project_id(record) == project_id
+            for envelope in _iter_source_envelopes(source_dir)
+            for record in envelope["episode_records"]
+        )
+        if has_matching_record:
+            matches.append(source_dir.name)
+            continue
+        job_path = job_status_path(root, source_type=source_type, source_id=source_dir.name)
+        if job_path.exists() and read_json(job_path).get("project_id") == project_id:
+            matches.append(source_dir.name)
     return matches
 
 
@@ -253,8 +274,7 @@ def forget_source(root: Path, source_id: str, *, project_id: str | None = None) 
         for artifact_file in sorted(source_dir.glob("sha256-*.json")):
             envelope = read_artifact(artifact_file)
             matches = project_id is None or any(
-                (record.get("project") or {}).get("project_id") == project_id
-                for record in envelope["episode_records"]
+                _record_project_id(record) == project_id for record in envelope["episode_records"]
             )
             if matches:
                 record_ids.extend(record["id"] for record in envelope["episode_records"])

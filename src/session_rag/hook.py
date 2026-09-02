@@ -24,11 +24,6 @@ class HookConfig:
     retrieval_timeout_ms: int = 500
     max_injected_tokens: int = 1000
     max_injected_records: int = 3
-    # A small, SEPARATE budget from retrieval_timeout_ms — metrics recording
-    # is strictly best-effort bookkeeping, never allowed to add unbounded
-    # latency to the hook path even if retrieval already used its full
-    # budget (see _record_metric_best_effort).
-    metrics_timeout_ms: int = 100
 
     @classmethod
     def from_env(cls) -> "HookConfig":
@@ -157,22 +152,28 @@ def _record_metric(artifacts_root: Path, *, latency_ms: float, outcome: str, res
 
 
 def _record_metric_best_effort(
-    artifacts_root: Path, *, latency_ms: float, outcome: str, result_count: int, timeout_seconds: float
+    artifacts_root: Path, *, latency_ms: float, outcome: str, result_count: int, remaining_seconds: float
 ) -> None:
-    """Metrics recording is strictly best-effort bookkeeping: bounded by its
-    own small, fixed timeout — independent of how much of retrieval_timeout_ms
-    the search/format work already used, and never itself allowed to add
-    unbounded latency to the hook path (a hung filesystem write must not be
-    able to delay prompt submission indefinitely). Runs through the same
-    daemon-thread timeout as retrieval (see _run_with_timeout), so a slow
-    writer is abandoned rather than awaited — reliable in the normal
-    (near-instant) case, silently dropped only in the pathological one.
-    Any failure — timeout or a genuine write error — is swallowed: metrics
-    must never change or delay the hook's actual response."""
+    """Metrics recording is strictly best-effort bookkeeping, bounded by
+    whatever's left of retrieval_timeout_ms after the timed retrieval unit
+    already returned — NOT a separate additive budget of its own, which
+    would let total hook latency exceed retrieval_timeout_ms even when the
+    write itself is fast. When retrieval already used the full budget (the
+    timeout case, remaining_seconds <= 0), this call still runs through
+    _run_with_timeout with essentially no time left: in practice that means
+    the write is immediately abandoned rather than attempted — metrics for
+    that particular invocation may simply not land, which is the accepted
+    trade-off for never letting a hung or slow writer add unbounded latency
+    on top of an already-exhausted budget. The abandoned daemon thread never
+    blocks process exit (see _run_with_timeout) and isn't waited on again
+    here — a background write that lands after we've moved on is a bonus,
+    not something relied on. Any failure — timeout or a genuine write
+    error — is swallowed: metrics must never change or delay the hook's
+    actual response."""
 
     try:
         _run_with_timeout(
-            timeout_seconds, _record_metric, artifacts_root,
+            max(remaining_seconds, 0.0), _record_metric, artifacts_root,
             latency_ms=latency_ms, outcome=outcome, result_count=result_count,
         )
     except Exception:
@@ -207,6 +208,7 @@ def handle_user_prompt(
 
     config = config or HookConfig.from_env()
     started = time.monotonic()
+    deadline = started + config.retrieval_timeout_ms / 1000
     prompt = event.get("prompt", "").strip()
     results: list[dict] = []
     context: str | None = None
@@ -242,7 +244,7 @@ def handle_user_prompt(
         latency_ms=latency_ms,
         outcome=outcome,
         result_count=len(results),
-        timeout_seconds=config.metrics_timeout_ms / 1000,
+        remaining_seconds=deadline - time.monotonic(),
     )
 
     if not context:

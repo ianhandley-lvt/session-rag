@@ -650,9 +650,10 @@ def test_hook_fails_open_on_slow_retrieval_timeout(tmp_path):
     )
 
     assert response == {}
-    metrics = [json.loads(line) for line in (artifacts_dir / "hook_metrics.jsonl").read_text().splitlines()]
-    assert metrics[-1]["outcome"] == "timeout"
-    assert "prompt" not in json.dumps(metrics[-1])
+    # Metric recording for THIS call has essentially no remaining budget
+    # (retrieval already used the full 10ms) and is itself best-effort — see
+    # test_hook_records_metric_without_prompt_text_on_success for the
+    # no-prompt-text guarantee in the case where recording does complete.
 
 
 class SlowInitEmbedder:
@@ -695,8 +696,6 @@ def test_hook_timeout_bounds_embedder_construction_not_just_search(tmp_path):
     # Bounded by the configured timeout, not the slow __init__ — proves
     # construction happens inside the timed path, not before it.
     assert elapsed_ms < 300
-    metrics = [json.loads(line) for line in (artifacts_dir / "hook_metrics.jsonl").read_text().splitlines()]
-    assert metrics[-1]["outcome"] == "timeout"
 
 
 def test_hook_timeout_bounds_formatting_not_just_construction_and_search(tmp_path, monkeypatch):
@@ -740,11 +739,9 @@ def test_hook_timeout_bounds_formatting_not_just_construction_and_search(tmp_pat
     # Bounded by the configured timeout, not the slow formatting step —
     # proves formatting runs inside the timed path, not after it.
     assert elapsed_ms < 300
-    metrics = [json.loads(line) for line in (artifacts_dir / "hook_metrics.jsonl").read_text().splitlines()]
-    assert metrics[-1]["outcome"] == "timeout"
 
 
-def test_hook_slow_metrics_writer_does_not_delay_the_hook_past_its_deadline(tmp_path, monkeypatch):
+def test_hook_slow_metrics_writer_does_not_delay_the_hook_past_the_retrieval_deadline(tmp_path, monkeypatch):
     import time
 
     import session_rag.hook as hook_module
@@ -764,6 +761,11 @@ def test_hook_slow_metrics_writer_does_not_delay_the_hook_past_its_deadline(tmp_
 
     monkeypatch.setattr(hook_module, "_record_metric", slow_record_metric)
 
+    # A small retrieval_timeout_ms leaves little remaining budget for
+    # metrics after the (near-instant) search — the slow writer's 300ms
+    # should be abandoned almost immediately, not awaited. Total latency
+    # must stay bounded by retrieval_timeout_ms ALONE, not
+    # retrieval_timeout_ms plus however slow the metrics writer is.
     started = time.monotonic()
     response = handle_user_prompt(
         {"hook_event_name": "UserPromptSubmit", "prompt": "hi"},
@@ -771,15 +773,13 @@ def test_hook_slow_metrics_writer_does_not_delay_the_hook_past_its_deadline(tmp_
         artifacts_dir,
         embedder,
         scope=RetrievalScope(global_scope=True),
-        config=HookConfig(metrics_timeout_ms=10),
+        config=HookConfig(retrieval_timeout_ms=50),
     )
     elapsed_ms = (time.monotonic() - started) * 1000
 
-    # Search itself succeeds fast (KeywordEmbedder, tiny corpus) — only the
-    # metrics write is artificially slow. The hook must still return
-    # promptly, and the response must be exactly what a fast metrics write
-    # would have produced — metrics failure/slowness never changes it.
-    assert elapsed_ms < 300
+    assert elapsed_ms < 150  # nowhere near the metrics writer's 300ms
+    # The response is exactly what a fast metrics write would have produced
+    # — metrics failure/slowness never changes it.
     assert response["hookSpecificOutput"]["additionalContext"]
 
 
@@ -811,7 +811,7 @@ def test_hook_metric_writer_exception_does_not_escape_or_change_response(tmp_pat
     assert response["hookSpecificOutput"]["additionalContext"]
 
 
-def test_hook_fails_open_within_bounded_total_when_retrieval_and_metrics_are_both_slow(tmp_path, monkeypatch):
+def test_hook_fails_open_within_retrieval_timeout_even_when_metrics_writer_is_also_slow(tmp_path, monkeypatch):
     import time
 
     import session_rag.hook as hook_module
@@ -830,21 +830,23 @@ def test_hook_fails_open_within_bounded_total_when_retrieval_and_metrics_are_bot
 
     monkeypatch.setattr(hook_module, "_record_metric", slow_record_metric)
 
+    # Retrieval itself already times out here (SlowEmbedder, 10ms budget),
+    # leaving ~0 remaining budget for metrics — the slow metrics writer must
+    # be abandoned immediately, not awaited for its own 300ms on top. Total
+    # latency stays bounded by retrieval_timeout_ms alone, proving metrics
+    # can never add its own delay when there's no time left to give it.
     started = time.monotonic()
     response = handle_user_prompt(
         {"hook_event_name": "UserPromptSubmit", "prompt": "hi"},
         database,
         artifacts_dir,
         SlowEmbedder(),
-        config=HookConfig(retrieval_timeout_ms=10, metrics_timeout_ms=10),
+        config=HookConfig(retrieval_timeout_ms=10),
     )
     elapsed_ms = (time.monotonic() - started) * 1000
 
     assert response == {}
-    # Bounded by retrieval_timeout_ms + metrics_timeout_ms (20ms combined
-    # budget), never by the slow embedder's or slow metrics writer's actual
-    # 300ms each — each stage has its own independent, small, fixed cap.
-    assert elapsed_ms < 300
+    assert elapsed_ms < 100
 
 
 def test_hook_fails_open_on_retrieval_error(tmp_path):
@@ -944,14 +946,12 @@ def test_hook_config_overridable_via_env(monkeypatch):
     monkeypatch.setenv("SESSION_RAG_RETRIEVAL_TIMEOUT_MS", "9999")
     monkeypatch.setenv("SESSION_RAG_MAX_INJECTED_TOKENS", "42")
     monkeypatch.setenv("SESSION_RAG_MAX_INJECTED_RECORDS", "1")
-    monkeypatch.setenv("SESSION_RAG_METRICS_TIMEOUT_MS", "17")
 
     config = HookConfig.from_env()
 
     assert config.retrieval_timeout_ms == 9999
     assert config.max_injected_tokens == 42
     assert config.max_injected_records == 1
-    assert config.metrics_timeout_ms == 17
 
 
 def test_hook_timeout_thread_is_daemon_and_does_not_block_process_exit(tmp_path):
@@ -1234,6 +1234,37 @@ def test_forget_project_leaves_no_trace_of_erased_job_status_anywhere_under_arti
             content = path.read_text()
             assert erased_hash not in content
             assert "a distinctive failure reason xyz123" not in content
+
+
+def test_forget_project_discovers_and_erases_a_source_with_only_a_failed_attempt(tmp_path, capsys):
+    # A source whose ONLY trace of a project is a failed extraction attempt
+    # (never produced an Episode Record) must still be discoverable and
+    # erasable by project-scoped forget — otherwise its attempted_hash and
+    # failure reason would never be removable for that project at all.
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript = tmp_path / "session-only-failed.jsonl"
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": "hi"}}) + "\n")
+    run(
+        ["extract-session", str(transcript), "--artifacts", str(artifacts_dir)],
+        extractor=FakeExtractor(
+            error=ExtractionPendingRetry("a distinctive never-succeeded reason"), project_id="project-a"
+        ),
+    )
+    job_path = job_status_path(artifacts_dir, source_type="claude_session", source_id="session-only-failed")
+    assert job_path.exists()
+    source_dir = artifacts_dir / "claude_session" / "session-only-failed"
+    assert source_dir.exists()
+
+    exit_code = run(
+        ["forget", "--project", "project-a", "--artifacts", str(artifacts_dir), "--database", str(database)]
+    )
+
+    assert exit_code == 0
+    assert not source_dir.exists()
+    for path in artifacts_dir.rglob("*"):
+        if path.is_file():
+            assert "a distinctive never-succeeded reason" not in path.read_text()
 
 
 def test_forget_project_does_not_block_reingestion(tmp_path, capsys):
