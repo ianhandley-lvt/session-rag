@@ -56,6 +56,9 @@ def index_episode_records(database: Path, records: list[dict], embedder: Embedde
             "project_id": (record.get("project") or {}).get("project_id") or "",
             "temporal_scope": record.get("temporal_scope") or "",
             "timestamp": record.get("timestamp") or "",
+            # -1 sentinel for "no location" — keeps the column a plain int,
+            # consistent with this file's other optional-field conventions.
+            "evidence_location": record.get("evidence_location") if record.get("evidence_location") is not None else -1,
             "embedding_model": embedder.model_name,
             "vector": vector,
         }

@@ -38,6 +38,11 @@ class ExtractedKnowledge(BaseModel):
     attribution: Attribution | None = None
     temporal_scope: TemporalScope | None = None
     timestamp: datetime | None = None
+    # 0-indexed line number in the sanitized transcript that supports this
+    # record. Model-proposed, application-validated (see CursorExtractor):
+    # rejected (set to null) if it falls outside the sanitized content's
+    # actual line range — never trusted as-is.
+    evidence_location: int | None = None
 
 
 class ProjectProvenance(BaseModel):
@@ -63,7 +68,6 @@ class StructuredRecord(ExtractedKnowledge):
 
     source: NonEmptyText
     source_session_id: ShortText
-    authority: Literal["working_session", "verified_decision", "unknown"] = "working_session"
 
     source_type: SourceType
     operator_id: ShortText

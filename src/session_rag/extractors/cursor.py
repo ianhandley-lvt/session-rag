@@ -57,6 +57,19 @@ def _person_attribution(attribution: Attribution | None) -> Attribution | None:
     return attribution
 
 
+def _validated_evidence_location(location: int | None, line_count: int) -> int | None:
+    """The model proposes a line number; application code decides whether to
+    trust it. A location outside the sanitized content's real range is a
+    forged/hallucinated claim about source identity — reject it (null), don't
+    pass it through."""
+
+    if location is None:
+        return None
+    if 0 <= location < line_count:
+        return location
+    return None
+
+
 def _json_from_model_text(text: str) -> dict:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -148,12 +161,16 @@ class CursorExtractor:
             "--trust",
         ]
         drafts = self._run_with_retries(command, prompt)
+        line_count = sanitized_content.count("\n") + 1 if sanitized_content else 0
         return [
             StructuredRecord(
-                **{**draft.model_dump(), "attribution": _person_attribution(draft.attribution)},
+                **{
+                    **draft.model_dump(),
+                    "attribution": _person_attribution(draft.attribution),
+                    "evidence_location": _validated_evidence_location(draft.evidence_location, line_count),
+                },
                 source=str(transcript.resolve()),
                 source_session_id=transcript.stem,
-                authority="working_session",
                 source_type="claude_session",
                 operator_id=self._operator_id,
                 project=self._project,
@@ -218,6 +235,7 @@ class CursorExtractor:
                         "attribution": "object {person: string, citation: string} or null",
                         "temporal_scope": "'durable' or 'time_sensitive' or null",
                         "timestamp": "ISO-8601 string or null",
+                        "evidence_location": "integer 0-indexed line number in transcript_data supporting this record, or null",
                     }
                 ]
             },
@@ -235,6 +253,10 @@ class CursorExtractor:
                 "Set temporal_scope to 'durable' for a decision or explanation that stays valid "
                 "until explicitly superseded, or 'time_sensitive' for a description of current "
                 "system state or circumstances that could go stale without an explicit correction.",
+                "Set evidence_location to the exact 0-indexed line number (counting from the top "
+                "of transcript_data) of the single line that most directly supports this record, "
+                "or null if no single line does. Count only lines actually present in "
+                "transcript_data — never guess or invent a line number.",
             ],
             "transcript_data": content,
         }

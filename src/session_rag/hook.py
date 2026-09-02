@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,12 +38,19 @@ def _estimate_tokens(text: str) -> int:
     return len(text.split())
 
 
+def _location_suffix(result: dict) -> str:
+    location = result.get("evidence_location")
+    if location is None or location < 0:
+        return ""
+    return f", line {location}"
+
+
 def _format_record(index: int, result: dict) -> str:
     return (
         f"[{index}] {result['text']}\n"
         f"Source: {result['source']} "
-        f"(artifact {result['source_type']}/{result['source_id']}/{result['source_hash']}, "
-        f"{result['timestamp']})"
+        f"(artifact {result['source_type']}/{result['source_id']}/{result['source_hash']}"
+        f"{_location_suffix(result)}, {result['timestamp']})"
     )
 
 
@@ -75,20 +83,24 @@ class _RetrievalTimeout(Exception):
     pass
 
 
-def _search_with_timeout(timeout_seconds: float, *args, **kwargs):
+def _run_with_timeout(timeout_seconds: float, fn, *args, **kwargs):
     """A plain daemon Thread, not ThreadPoolExecutor: executor worker threads
     are non-daemon, and Python's interpreter-exit hook joins every thread any
-    executor ever spawned before the process can exit — so a hung search()
+    executor ever spawned before the process can exit — so a hung fn() call
     would hang the CLI subprocess itself at exit even after this function
     returns, silently defeating the timeout for the one-shot-process usage
     this hook actually runs under. A daemon thread never blocks process exit,
-    even if it's still running when we give up waiting on it."""
+    even if it's still running when we give up waiting on it.
+
+    Generic over fn so the timeout can bound embedder construction *and*
+    search() as a single unit — not just search() — closing the gap where
+    process/model-init latency previously fell outside retrieval_timeout_ms."""
 
     box: dict = {}
 
     def worker():
         try:
-            box["value"] = search(*args, **kwargs)
+            box["value"] = fn(*args, **kwargs)
         except Exception as error:
             box["error"] = error
 
@@ -100,6 +112,21 @@ def _search_with_timeout(timeout_seconds: float, *args, **kwargs):
     if "error" in box:
         raise box["error"]
     return box["value"]
+
+
+def _build_embedder_and_search(
+    embedder_factory: Callable[[], Embedder],
+    database: Path,
+    artifacts_root: Path,
+    query: str,
+    config: RetrievalConfig,
+    scope: RetrievalScope | None,
+):
+    """Constructs the embedder and runs search() as one unit, so both fall
+    inside the same timed daemon thread (see _run_with_timeout)."""
+
+    embedder = embedder_factory()
+    return search(database, artifacts_root, query, embedder, config, scope)
 
 
 def _record_metric(artifacts_root: Path, *, latency_ms: float, outcome: str, result_count: int) -> None:
@@ -119,13 +146,28 @@ def handle_user_prompt(
     event: dict,
     database: Path,
     artifacts_root: Path,
-    embedder: Embedder,
+    embedder: Embedder | None = None,
     scope: RetrievalScope | None = None,
     config: HookConfig | None = None,
+    embedder_factory: Callable[[], Embedder] | None = None,
 ) -> dict:
     # scope is trusted application context, resolved independently of `event`
     # (see RetrievalScope.from_env) — the prompt itself can never supply or
     # widen it, closing an injection path (ADR-0004).
+    #
+    # Exactly one of embedder/embedder_factory is expected: embedder for
+    # callers (mostly tests) that already hold a constructed instance,
+    # embedder_factory for real hook invocations, where construction itself
+    # must fall inside retrieval_timeout_ms (see _build_embedder_and_search).
+    # A pre-built embedder is wrapped as a trivial factory so both paths run
+    # through the same timed call.
+    if embedder is not None:
+        resolved_factory = lambda: embedder  # noqa: E731
+    elif embedder_factory is not None:
+        resolved_factory = embedder_factory
+    else:
+        raise ValueError("handle_user_prompt requires embedder or embedder_factory")
+
     config = config or HookConfig.from_env()
     started = time.monotonic()
     prompt = event.get("prompt", "").strip()
@@ -140,8 +182,15 @@ def handle_user_prompt(
         # back to dataclass defaults every hook call.
         retrieval_config = replace(RetrievalConfig.from_env(), max_results=config.max_injected_records)
         try:
-            results, _trace = _search_with_timeout(
-                config.retrieval_timeout_ms / 1000, database, artifacts_root, prompt, embedder, retrieval_config, scope
+            results, _trace = _run_with_timeout(
+                config.retrieval_timeout_ms / 1000,
+                _build_embedder_and_search,
+                resolved_factory,
+                database,
+                artifacts_root,
+                prompt,
+                retrieval_config,
+                scope,
             )
         except _RetrievalTimeout:
             outcome = "timeout"

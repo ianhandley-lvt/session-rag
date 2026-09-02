@@ -197,6 +197,20 @@ def find_record(root: Path, record_id: str) -> dict | None:
     return None
 
 
+def find_sources_by_project(root: Path, project_id: str) -> list[str]:
+    """Every source_id with at least one Episode Record (in any revision)
+    whose Project Provenance matches project_id. Used by project-wide
+    forget to discover which sources to erase."""
+
+    matches: list[str] = []
+    for _, source_dir in _iter_source_dirs(root):
+        for envelope in _iter_source_envelopes(source_dir):
+            if any((record.get("project") or {}).get("project_id") == project_id for record in envelope["episode_records"]):
+                matches.append(source_dir.name)
+                break
+    return matches
+
+
 def forget_source(root: Path, source_id: str) -> list[str]:
     """Hard-delete every artifact revision (all hashes, active pointer, job
     status) for one source, across whichever source_type it lives under.

@@ -93,7 +93,7 @@ def test_strong_exact_phrase_qualifies_despite_weak_vector_similarity(tmp_path):
     # Raise both floors so this specifically isolates the exact-phrase fallback,
     # not a real (and legitimate) BM25 FTS score also clearing a default floor.
     config = RetrievalConfig(vector_distance_ceiling=0.01, lexical_score_floor=1_000_000.0)
-    results, trace = search(database, artifacts, needle, embedder, config)
+    results, trace = search(database, artifacts, needle, embedder, config, scope=RetrievalScope(global_scope=True))
 
     assert len(results) == 1
     assert trace["candidates"][0]["qualification_reason"] == "exact_phrase"
@@ -166,7 +166,9 @@ def test_ranking_order_verified_durable_beats_unreviewed_durable_beats_time_sens
     verify(artifacts, rows[0]["id"])
     # rows[1] stays unreviewed; rows[2] stays unreviewed but is time_sensitive.
 
-    results, _trace = search(database, artifacts, "match", embedder, RetrievalConfig(max_results=3))
+    results, _trace = search(
+        database, artifacts, "match", embedder, RetrievalConfig(max_results=3), scope=RetrievalScope(global_scope=True)
+    )
 
     assert [r["id"] for r in results] == [rows[0]["id"], rows[1]["id"], rows[2]["id"]]
 
@@ -179,9 +181,12 @@ def test_config_constants_are_overridable(tmp_path):
     index_episode_records(database, [row], embedder)
     _activate(artifacts, row)
 
+    global_scope = RetrievalScope(global_scope=True)
     # Default ceiling (1.0) would qualify; a strict override should not.
-    results_default, _ = search(database, artifacts, "query text", embedder)
-    results_strict, _ = search(database, artifacts, "query text", embedder, RetrievalConfig(vector_distance_ceiling=0.0))
+    results_default, _ = search(database, artifacts, "query text", embedder, scope=global_scope)
+    results_strict, _ = search(
+        database, artifacts, "query text", embedder, RetrievalConfig(vector_distance_ceiling=0.0), scope=global_scope
+    )
 
     assert len(results_default) == 1
     assert results_strict == []
@@ -195,7 +200,7 @@ def test_retrieval_trace_contains_raw_scores_for_every_candidate(tmp_path):
     index_episode_records(database, [row], embedder)
     _activate(artifacts, row)
 
-    _results, trace = search(database, artifacts, "rabbitmq", embedder)
+    _results, trace = search(database, artifacts, "rabbitmq", embedder, scope=RetrievalScope(global_scope=True))
 
     assert trace["query"] == "rabbitmq"
     candidate = trace["candidates"][0]
@@ -215,7 +220,7 @@ def test_retrieval_trace_is_persisted_without_query_text(tmp_path):
     index_episode_records(database, [row], embedder)
     _activate(artifacts, row)
 
-    search(database, artifacts, "a secret query about rabbitmq", embedder)
+    search(database, artifacts, "a secret query about rabbitmq", embedder, scope=RetrievalScope(global_scope=True))
 
     logged = [json_module.loads(line) for line in (artifacts / "retrieval_traces.jsonl").read_text().splitlines()]
     assert len(logged) == 1
@@ -234,7 +239,7 @@ def test_exact_match_fallback_finds_a_distinctive_token_within_a_longer_query(tm
     config = RetrievalConfig(vector_distance_ceiling=0.01, lexical_score_floor=1_000_000.0)
 
     query = f"why does {identifier} keep failing"
-    results, trace = search(database, artifacts, query, embedder, config)
+    results, trace = search(database, artifacts, query, embedder, config, scope=RetrievalScope(global_scope=True))
 
     assert len(results) == 1
     assert trace["candidates"][0]["qualification_reason"] == "exact_phrase"
@@ -307,10 +312,10 @@ def test_unscoped_records_excluded_from_project_scoped_search_but_visible_global
 
     assert scoped == []
     assert [r["id"] for r in global_results] == [unscoped_row["id"]]
-    # No configured current project either — no cross-workspace disclosure
-    # risk exists here, so an unscoped query matching an unscoped record is
-    # not the leak Retrieval Scope exists to prevent (see permits()).
-    assert [r["id"] for r in default_scope] == [unscoped_row["id"]]
+    # No project configured either — but an unscoped record must still
+    # require an *explicit* global scope, never surfacing as a side effect
+    # of the query also lacking a project_id. No implicit third scope state.
+    assert default_scope == []
 
 
 def test_scope_from_env_defaults_isolate_projects(tmp_path, monkeypatch):
@@ -345,3 +350,70 @@ def test_scope_from_env_global_flag_enables_cross_project(tmp_path, monkeypatch)
     results, _trace = search(database, artifacts, "rabbitmq", embedder)
 
     assert [r["id"] for r in results] == [row_b["id"]]
+
+
+def test_hook_default_scope_returns_no_unscoped_or_cross_project_records(tmp_path):
+    database = tmp_path / "db.lance"
+    artifacts = tmp_path / "artifacts"
+    unscoped_row = _row("sha256:h:0:0", "rabbitmq heartbeat", source_id="s1", source_hash="sha256:h:0")
+    scoped_row = _row(
+        "sha256:h:0:1", "rabbitmq heartbeat", source_id="s2", source_hash="sha256:h:1", project_id="project-b"
+    )
+    embedder = FixedEmbedder({"rabbitmq heartbeat\n": 0.0, "rabbitmq": 0.0})
+    index_episode_records(database, [unscoped_row, scoped_row], embedder)
+    _activate(artifacts, unscoped_row)
+    set_active_hash(artifacts, source_type="claude_session", source_id="s2", hash_value="sha256:h:1")
+
+    # No scope object passed at all — default hook behavior, no project
+    # configured, no global scope enabled.
+    response = handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "rabbitmq"}, database, artifacts, embedder
+    )
+
+    assert response == {}
+
+
+def test_verified_boost_outranks_unreviewed_time_sensitive_of_equal_age(tmp_path):
+    database = tmp_path / "db.lance"
+    artifacts = tmp_path / "artifacts"
+    same_timestamp = _iso_days_ago(5)
+    rows = [
+        _row(
+            "sha256:h:0:0", "match verified", source_id="a", source_hash="sha256:a",
+            temporal_scope="time_sensitive", timestamp=same_timestamp,
+        ),
+        _row(
+            "sha256:h:0:1", "match unreviewed", source_id="b", source_hash="sha256:b",
+            temporal_scope="time_sensitive", timestamp=same_timestamp,
+        ),
+    ]
+    # Identical vector/text relevance and identical age/temporal_scope —
+    # decay alone gives both the same multiplier. Only the verified boost
+    # should separate them.
+    embedder = FixedEmbedder({row["question"] + "\n": 0.0 for row in rows} | {"match": 0.0})
+    index_episode_records(database, rows, embedder)
+    for row in rows:
+        set_active_hash(artifacts, source_type="claude_session", source_id=row["source_id"], hash_value=row["source_hash"])
+    verify(artifacts, rows[0]["id"])
+
+    results, _trace = search(
+        database, artifacts, "match", embedder, RetrievalConfig(max_results=2), scope=RetrievalScope(global_scope=True)
+    )
+
+    assert [r["id"] for r in results] == [rows[0]["id"], rows[1]["id"]]
+
+
+def test_verified_boost_is_configurable(tmp_path):
+    database = tmp_path / "db.lance"
+    artifacts = tmp_path / "artifacts"
+    row = _row("sha256:h:0:0", "match", source_id="a", source_hash="sha256:a")
+    embedder = FixedEmbedder({"match\n": 0.0, "match": 0.0})
+    index_episode_records(database, [row], embedder)
+    _activate(artifacts, row, source_id="a", source_hash="sha256:a")
+    verify(artifacts, row["id"])
+
+    _results, trace = search(
+        database, artifacts, "match", embedder, RetrievalConfig(verified_boost=2.5), scope=RetrievalScope(global_scope=True)
+    )
+
+    assert trace["candidates"][0]["verification_boost"] == 2.5

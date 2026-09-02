@@ -6,9 +6,9 @@ import pytest
 
 from session_rag.artifacts import artifact_path, find_record, job_status_path, read_active_hash
 from session_rag.cli import run
-from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry
+from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry, ProjectProvenance
 from session_rag.hook import HookConfig, _INTRO, _estimate_tokens, _format_record, handle_user_prompt
-from session_rag.retrieval import search
+from session_rag.retrieval import RetrievalScope, search
 
 from conftest import make_record
 
@@ -63,7 +63,7 @@ def test_cli_ingests_from_artifacts_and_returns_cited_search_results(tmp_path, c
 
     assert run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder) == 0
     capsys.readouterr()
-    assert run(["search", "rabbitmq timeout", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder) == 0
+    assert run(["search", "rabbitmq timeout", "--database", str(database), "--artifacts", str(artifacts_dir), "--global-scope"], embedder) == 0
 
     output = capsys.readouterr().out
     assert "heartbeat timeout caused the reconnect" in output
@@ -89,6 +89,7 @@ def test_user_prompt_hook_returns_additional_context(tmp_path):
         database,
         artifacts_dir,
         embedder,
+        scope=RetrievalScope(global_scope=True),
     )
 
     assert response["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
@@ -118,7 +119,7 @@ def test_cli_ingest_rebuilds_index_from_artifacts_alone_no_reextraction(tmp_path
     # No extractor passed — if ingest ever tried to re-extract, this would crash.
     exit_code = run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
     capsys.readouterr()
-    run(["search", "rabbitmq timeout", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder)
+    run(["search", "rabbitmq timeout", "--database", str(database), "--artifacts", str(artifacts_dir), "--global-scope"], embedder)
     output = capsys.readouterr().out
 
     assert exit_code == 0
@@ -135,7 +136,7 @@ def test_search_result_citation_resolves_to_the_exact_artifact_file(tmp_path):
     embedder = KeywordEmbedder()
     run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
 
-    results, _trace = search(database, artifacts_dir, "rabbitmq", embedder)
+    results, _trace = search(database, artifacts_dir, "rabbitmq", embedder, scope=RetrievalScope(global_scope=True))
 
     assert len(results) == 1
     result = results[0]
@@ -157,7 +158,7 @@ def test_cli_ingest_indexes_only_active_revision(tmp_path, capsys):
 
     run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
     capsys.readouterr()
-    run(["search", "new question", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder)
+    run(["search", "new question", "--database", str(database), "--artifacts", str(artifacts_dir), "--global-scope"], embedder)
     output = capsys.readouterr().out
 
     assert "New question" in output
@@ -488,7 +489,7 @@ def test_verification_state_survives_lancedb_rebuild(tmp_path, capsys):
     shutil.rmtree(database)
     run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
     capsys.readouterr()
-    run(["search", "rabbitmq postgres", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder)
+    run(["search", "rabbitmq postgres", "--database", str(database), "--artifacts", str(artifacts_dir), "--global-scope"], embedder)
     output = capsys.readouterr().out
 
     assert "RabbitMQ heartbeat issue" not in output
@@ -627,6 +628,50 @@ def test_hook_fails_open_on_slow_retrieval_timeout(tmp_path):
     assert "prompt" not in json.dumps(metrics[-1])
 
 
+class SlowInitEmbedder:
+    """Simulates process/model-init latency happening in the constructor —
+    not in embed() — proving retrieval_timeout_ms bounds embedder
+    construction too, not just search() (Fix 6)."""
+
+    dimensions = 2
+    model_name = "slow-init-test"
+
+    def __init__(self):
+        import time
+
+        time.sleep(0.3)
+
+    def embed(self, texts):
+        return [[0.0, 0.0] for _ in texts]
+
+
+def test_hook_timeout_bounds_embedder_construction_not_just_search(tmp_path):
+    import time
+
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    _extract_and_activate(artifacts_dir, transcript, "hi", question="Q", summary="S")
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], KeywordEmbedder())
+
+    started = time.monotonic()
+    response = handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "hi"},
+        database,
+        artifacts_dir,
+        embedder_factory=SlowInitEmbedder,
+        config=HookConfig(retrieval_timeout_ms=10),
+    )
+    elapsed_ms = (time.monotonic() - started) * 1000
+
+    assert response == {}
+    # Bounded by the configured timeout, not the slow __init__ — proves
+    # construction happens inside the timed path, not before it.
+    assert elapsed_ms < 300
+    metrics = [json.loads(line) for line in (artifacts_dir / "hook_metrics.jsonl").read_text().splitlines()]
+    assert metrics[-1]["outcome"] == "timeout"
+
+
 def test_hook_fails_open_on_retrieval_error(tmp_path):
     transcript = tmp_path / "session-123.jsonl"
     artifacts_dir = tmp_path / "artifacts"
@@ -652,7 +697,9 @@ def test_hook_records_metric_without_prompt_text_on_success(tmp_path):
     run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
 
     handle_user_prompt(
-        {"hook_event_name": "UserPromptSubmit", "prompt": "a secret prompt about rabbitmq"}, database, artifacts_dir, embedder
+        {"hook_event_name": "UserPromptSubmit", "prompt": "a secret prompt about rabbitmq"},
+        database, artifacts_dir, embedder,
+        scope=RetrievalScope(global_scope=True),
     )
 
     log_text = (artifacts_dir / "hook_metrics.jsonl").read_text()
@@ -677,6 +724,7 @@ def test_hook_never_injects_more_than_max_injected_records(tmp_path):
         database,
         artifacts_dir,
         embedder,
+        scope=RetrievalScope(global_scope=True),
         config=HookConfig(max_injected_records=3, max_injected_tokens=100_000),
     )
 
@@ -696,7 +744,8 @@ def test_hook_omits_whole_records_rather_than_truncating_for_token_budget(tmp_pa
 
     # Size the budget precisely: room for the intro plus exactly one record,
     # not two — using the module's own token estimate so this isn't a guess.
-    full_response, _trace = search(database, artifacts_dir, "rabbitmq", embedder)
+    global_scope = RetrievalScope(global_scope=True)
+    full_response, _trace = search(database, artifacts_dir, "rabbitmq", embedder, scope=global_scope)
     one_record_tokens = _estimate_tokens(_format_record(1, full_response[0]))
     budget = _estimate_tokens(_INTRO) + one_record_tokens + 1
 
@@ -705,6 +754,7 @@ def test_hook_omits_whole_records_rather_than_truncating_for_token_budget(tmp_pa
         database,
         artifacts_dir,
         embedder,
+        scope=global_scope,
         config=HookConfig(max_injected_records=3, max_injected_tokens=budget),
     )
 
@@ -771,3 +821,132 @@ def test_hook_layers_max_injected_records_on_top_of_env_tuned_retrieval_config(t
     )
 
     assert response == {}
+
+
+def test_injected_claim_resolves_to_exact_source_revision_and_evidence_location(tmp_path):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": "why did rabbitmq reconnect"}}) + "\n")
+    record = make_record(
+        question="Q",
+        summary="RabbitMQ heartbeat",
+        source=str(transcript.resolve()),
+        source_session_id="session-123",
+        evidence_location=0,
+    )
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts_dir)], extractor=FakeExtractor([record]))
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    global_scope = RetrievalScope(global_scope=True)
+    response = handle_user_prompt(
+        {"hook_event_name": "UserPromptSubmit", "prompt": "why did rabbitmq reconnect"},
+        database, artifacts_dir, embedder, scope=global_scope,
+    )
+
+    context = response["hookSpecificOutput"]["additionalContext"]
+    results, _trace = search(database, artifacts_dir, "rabbitmq", embedder, scope=global_scope)
+    result = results[0]
+    active_hash = read_active_hash(artifacts_dir, source_type=result["source_type"], source_id=result["source_id"])
+    resolved_path = artifact_path(
+        artifacts_dir, source_type=result["source_type"], source_id=result["source_id"], hash_value=active_hash
+    )
+
+    assert resolved_path.exists()
+    assert result["source_hash"] == active_hash
+    assert result["evidence_location"] == 0
+    assert "line 0" in context
+
+
+def _extract_with_project(artifacts_dir, transcript, content, question, summary, project_id, capsys):
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": content}}) + "\n")
+    record = make_record(
+        question=question,
+        summary=summary,
+        source=str(transcript.resolve()),
+        source_session_id=transcript.stem,
+        project=ProjectProvenance(project_id=project_id),
+    )
+    capsys.readouterr()
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts_dir)], extractor=FakeExtractor([record]))
+    output = json.loads(capsys.readouterr().out)
+    return output["records"][0]["id"]
+
+
+def test_forget_project_removes_all_sources_for_that_project_and_isolates_others(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript_a1 = tmp_path / "session-a1.jsonl"
+    transcript_a2 = tmp_path / "session-a2.jsonl"
+    transcript_b = tmp_path / "session-b.jsonl"
+    record_a1 = _extract_with_project(artifacts_dir, transcript_a1, "hi a1", "QA1", "SA1", "project-a", capsys)
+    record_a2 = _extract_with_project(artifacts_dir, transcript_a2, "hi a2", "QA2", "SA2", "project-a", capsys)
+    record_b = _extract_with_project(artifacts_dir, transcript_b, "hi b", "QB", "SB", "project-b", capsys)
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database),], embedder)
+    run(["search", "hi", "--database", str(database), "--artifacts", str(artifacts_dir), "--global-scope"], embedder)
+
+    exit_code = run(["forget", "--project", "project-a", "--artifacts", str(artifacts_dir), "--database", str(database)])
+
+    assert exit_code == 0
+    # Project A's sources are fully erased.
+    assert not (artifacts_dir / "claude_session" / "session-a1").exists()
+    assert not (artifacts_dir / "claude_session" / "session-a2").exists()
+    assert find_record(artifacts_dir, record_a1) is None
+    assert find_record(artifacts_dir, record_a2) is None
+    # Project B is untouched.
+    assert (artifacts_dir / "claude_session" / "session-b").exists()
+    assert find_record(artifacts_dir, record_b) is not None
+
+
+def test_forget_project_removes_lancedb_rows_and_traces_but_not_other_projects(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript_a = tmp_path / "session-a.jsonl"
+    transcript_b = tmp_path / "session-b.jsonl"
+    record_a = _extract_with_project(artifacts_dir, transcript_a, "alpha content", "QA", "SA project-a", "project-a", capsys)
+    record_b = _extract_with_project(artifacts_dir, transcript_b, "beta content", "QB", "SB project-b", "project-b", capsys)
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+    capsys.readouterr()
+    run(["search", "SA", "--database", str(database), "--artifacts", str(artifacts_dir), "--global-scope"], embedder)
+    trace_log = artifacts_dir / "retrieval_traces.jsonl"
+    assert record_a in trace_log.read_text()
+
+    run(["forget", "--project", "project-a", "--artifacts", str(artifacts_dir), "--database", str(database)])
+
+    assert record_a not in trace_log.read_text()
+    capsys.readouterr()
+    run(["search", "project-b", "--database", str(database), "--artifacts", str(artifacts_dir), "--global-scope"], embedder)
+    output = capsys.readouterr().out
+    assert "SB project-b" in output
+
+
+def test_forget_project_does_not_block_reingestion(tmp_path, capsys):
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    transcript = tmp_path / "session-a.jsonl"
+    _extract_with_project(artifacts_dir, transcript, "hi", "QA", "SA", "project-a", capsys)
+    run(["forget", "--project", "project-a", "--artifacts", str(artifacts_dir), "--database", str(database)])
+
+    record = make_record(
+        question="Q2", summary="S2", source=str(transcript.resolve()), source_session_id="session-a",
+        project=ProjectProvenance(project_id="project-a"),
+    )
+    exit_code = run(
+        ["extract-session", str(transcript), "--artifacts", str(artifacts_dir)], extractor=FakeExtractor([record])
+    )
+
+    assert exit_code == 0
+    assert (artifacts_dir / "claude_session" / "session-a").exists()
+
+
+def test_forget_requires_exactly_one_of_source_id_or_project(tmp_path):
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+    database = tmp_path / "memory.lance"
+
+    exit_code = run(["forget", "--artifacts", str(artifacts_dir), "--database", str(database)])
+
+    assert exit_code == 1

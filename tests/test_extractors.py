@@ -511,3 +511,51 @@ def test_explicit_cursor_configuration_overrides_environment(tmp_path, monkeypat
 
     assert observed["command"][4:6] == ["--mode", "ask"]
     assert ["--model", "gemini-3.7-flash-low"] == observed["command"][6:8]
+
+
+def test_cursor_extractor_no_longer_sets_authority(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S"}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert "authority" not in records[0].model_dump()
+
+
+def test_cursor_extractor_accepts_evidence_location_within_range(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)  # sanitizes to exactly one line (index 0)
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S", "evidence_location": 0}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert records[0].evidence_location == 0
+
+
+def test_cursor_extractor_rejects_out_of_range_evidence_location(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)  # only line 0 exists
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S", "evidence_location": 5}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert records[0].evidence_location is None
+
+
+def test_cursor_extractor_rejects_negative_evidence_location(tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    write_transcript(transcript)
+
+    def runner(*args, **kwargs):
+        return cursor_response({"records": [{"question": "Q", "summary": "S", "evidence_location": -3}]})
+
+    records = CursorExtractor(runner=runner).extract(transcript)
+
+    assert records[0].evidence_location is None
