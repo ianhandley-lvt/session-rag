@@ -2,20 +2,19 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import lancedb
 
 from .artifacts import read_active_hash
+from .envconfig import config_from_env
 from .jsonio import append_json_line
 from .overlay import EXCLUDED_FROM_SEARCH, read_state
 from .store import Embedder, TABLE_NAME
 
 TRACE_LOG_NAME = "retrieval_traces.jsonl"
-
-_ENV_PREFIX = "SESSION_RAG_"
 
 
 @dataclass(frozen=True)
@@ -62,15 +61,7 @@ class RetrievalConfig:
 
     @classmethod
     def from_env(cls) -> "RetrievalConfig":
-        defaults = cls()
-        overrides = {}
-        for field in fields(cls):
-            raw = os.getenv(_ENV_PREFIX + field.name.upper())
-            if raw is None:
-                continue
-            # `from __future__ import annotations` makes field.type a string, not a type object.
-            overrides[field.name] = int(raw) if field.type == "int" else float(raw)
-        return cls(**{**{f.name: getattr(defaults, f.name) for f in fields(cls)}, **overrides})
+        return config_from_env(cls)
 
 
 def _fetch_candidates(database: Path, query: str, embedder: Embedder, fetch_limit: int) -> dict[str, dict]:
