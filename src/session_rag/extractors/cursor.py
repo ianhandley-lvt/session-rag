@@ -7,6 +7,8 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from .base import (
     Attribution,
     EvidenceLocation,
@@ -173,22 +175,30 @@ class CursorExtractor:
             "--trust",
         ]
         drafts = self._run_with_retries(command, prompt)
-        return [
-            StructuredRecord(
-                **{
-                    **draft.model_dump(),
-                    "attribution": _person_attribution(draft.attribution),
-                    "evidence_location": _resolved_evidence_location(draft.evidence_location, sanitized),
-                },
-                source=str(transcript.resolve()),
-                source_session_id=transcript.stem,
-                source_type="claude_session",
-                operator_id=self._operator_id,
-                project=self._project,
-                prompt_version=self._prompt_version,
-            )
-            for draft in drafts
-        ]
+        try:
+            return [
+                StructuredRecord(
+                    **{
+                        **draft.model_dump(),
+                        "attribution": _person_attribution(draft.attribution),
+                        "evidence_location": _resolved_evidence_location(draft.evidence_location, sanitized),
+                    },
+                    source=str(transcript.resolve()),
+                    source_session_id=transcript.stem,
+                    source_type="claude_session",
+                    operator_id=self._operator_id,
+                    project=self._project,
+                    prompt_version=self._prompt_version,
+                )
+                for draft in drafts
+            ]
+        except ValidationError as error:
+            # Cursor has already returned at this point, so this is not a
+            # provider retry. Convert application-side provenance/schema
+            # attachment failures into the extractor's domain error so the
+            # pipeline records `failed`, preserves the prior Active Revision,
+            # and never leaks an uncaught traceback.
+            raise ExtractionError(f"Extracted record failed trusted provenance validation: {error}") from error
 
     def _run_with_retries(self, command: list[str], prompt: str) -> list[ExtractedKnowledge]:
         """Call Cursor and parse its response, retrying only invalid output a

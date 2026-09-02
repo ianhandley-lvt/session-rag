@@ -1,0 +1,16 @@
+#!/bin/sh
+
+set -u
+
+if ! /opt/homebrew/bin/uv run \
+  --quiet \
+  --project /Users/ian.handley/src/personal/session-rag \
+  session-rag hook \
+  --database /Users/ian.handley/.local/share/session-rag/lancedb \
+  --artifacts /Users/ian.handley/.local/share/session-rag/artifacts \
+  "$@"
+then
+  printf '{}\n'
+fi
+
+exit 0
