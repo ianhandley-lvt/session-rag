@@ -5,7 +5,7 @@ from typing import Protocol
 
 import lancedb
 
-from .transcripts import SessionMemory
+TABLE_NAME = "episode_records"
 
 
 class Embedder(Protocol):
@@ -15,25 +15,48 @@ class Embedder(Protocol):
     def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
-TABLE_NAME = "session_memories"
+def _retrieval_text(record: dict) -> str:
+    """Assembled from question/summary/resolution/systems/code_references —
+    the fields a search over durable knowledge should match against, not the
+    raw conversational transcript."""
+
+    parts = [record["question"], record["summary"]]
+    if record.get("resolution"):
+        parts.append(record["resolution"])
+    if record.get("systems"):
+        parts.append(", ".join(record["systems"]))
+    if record.get("code_references"):
+        parts.append(", ".join(record["code_references"]))
+    return "\n".join(parts)
 
 
-def index_memories(database: Path, memories: list[SessionMemory], embedder: Embedder) -> int:
-    if not memories:
+def index_episode_records(database: Path, records: list[dict], embedder: Embedder) -> int:
+    """Build the LanceDB index purely by replaying Episode Records (from
+    Extraction Artifacts) — never raw transcripts. LanceDB is a disposable
+    derived index (ADR-0001): deleting it and re-running this against the
+    same artifacts reproduces it exactly, with no re-extraction."""
+
+    if not records:
         return 0
     database.mkdir(parents=True, exist_ok=True)
-    vectors = embedder.embed([memory.text for memory in memories])
+    texts = [_retrieval_text(record) for record in records]
+    vectors = embedder.embed(texts)
     rows = [
         {
-            "id": memory.id,
-            "session_id": memory.session_id,
-            "text": memory.text,
-            "source": memory.source,
-            "timestamp": memory.timestamp,
+            "id": record["id"],
+            "question": record["question"],
+            "summary": record["summary"],
+            "text": text,
+            "source": record["source"],
+            "source_type": record["source_type"],
+            "source_id": record["source_id"],
+            "source_session_id": record["source_session_id"],
+            "source_hash": record["source_hash"],
+            "timestamp": record.get("timestamp") or "",
             "embedding_model": embedder.model_name,
             "vector": vector,
         }
-        for memory, vector in zip(memories, vectors, strict=True)
+        for record, text, vector in zip(records, texts, vectors, strict=True)
     ]
     connection = lancedb.connect(database)
     table = connection.create_table(TABLE_NAME, data=rows, mode="overwrite")
@@ -52,7 +75,7 @@ def _rrf(result_lists: list[list[dict]], limit: int) -> list[dict]:
     return [rows[row_id] for row_id in sorted(scores, key=scores.get, reverse=True)[:limit]]
 
 
-def search_memories(database: Path, query: str, embedder: Embedder, limit: int = 4) -> list[dict]:
+def search_episode_records(database: Path, query: str, embedder: Embedder, limit: int = 4) -> list[dict]:
     if not database.exists():
         return []
     connection = lancedb.connect(database)
@@ -70,4 +93,3 @@ def search_memories(database: Path, query: str, embedder: Embedder, limit: int =
     except Exception:
         text_rows = []
     return _rrf([vector_rows, text_rows], limit)
-
