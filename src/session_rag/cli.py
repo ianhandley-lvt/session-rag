@@ -21,7 +21,8 @@ from .overlay import (
     verify,
 )
 from .pipeline import run_extraction
-from .store import Embedder, index_episode_records, search_episode_records
+from .retrieval import search as retrieval_search
+from .store import Embedder, index_episode_records
 
 
 def _add_record_command_args(subparser: argparse.ArgumentParser) -> None:
@@ -41,11 +42,13 @@ def parser() -> argparse.ArgumentParser:
     extract.add_argument("--extractor", default="cursor", choices=["cursor"])
     extract.add_argument("--cursor-mode", choices=["ask", "plan"])
     extract.add_argument("--cursor-model")
-    search = commands.add_parser("search")
-    search.add_argument("query")
-    search.add_argument("--database", type=Path, required=True)
+    search_cmd = commands.add_parser("search")
+    search_cmd.add_argument("query")
+    search_cmd.add_argument("--database", type=Path, required=True)
+    search_cmd.add_argument("--artifacts", type=Path, required=True)
     hook = commands.add_parser("hook")
     hook.add_argument("--database", type=Path, required=True)
+    hook.add_argument("--artifacts", type=Path, required=True)
     _add_record_command_args(commands.add_parser("verify"))
     _add_record_command_args(commands.add_parser("reject"))
     supersede_cmd = commands.add_parser("supersede")
@@ -107,13 +110,13 @@ def run(
         )
     elif args.command == "search":
         selected_embedder = embedder or FastEmbedder()
-        results = search_episode_records(args.database, args.query, selected_embedder)
+        results, _trace = retrieval_search(args.database, args.artifacts, args.query, selected_embedder)
         print(format_context(results) if results else "No relevant session memory found.")
     elif args.command == "hook":
         selected_embedder = embedder or FastEmbedder()
         try:
             event = json.load(sys.stdin)
-            print(json.dumps(handle_user_prompt(event, args.database, selected_embedder)))
+            print(json.dumps(handle_user_prompt(event, args.database, args.artifacts, selected_embedder)))
         except Exception:
             print("{}")
     elif args.command in {"verify", "reject", "supersede", "history"}:

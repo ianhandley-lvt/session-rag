@@ -8,7 +8,7 @@ from session_rag.artifacts import artifact_path, job_status_path, read_active_ha
 from session_rag.cli import run
 from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry
 from session_rag.hook import handle_user_prompt
-from session_rag.store import search_episode_records
+from session_rag.retrieval import search
 
 from conftest import make_record
 
@@ -63,7 +63,7 @@ def test_cli_ingests_from_artifacts_and_returns_cited_search_results(tmp_path, c
 
     assert run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder) == 0
     capsys.readouterr()
-    assert run(["search", "rabbitmq timeout", "--database", str(database)], embedder) == 0
+    assert run(["search", "rabbitmq timeout", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder) == 0
 
     output = capsys.readouterr().out
     assert "heartbeat timeout caused the reconnect" in output
@@ -87,6 +87,7 @@ def test_user_prompt_hook_returns_additional_context(tmp_path):
     response = handle_user_prompt(
         {"hook_event_name": "UserPromptSubmit", "prompt": "What caused RabbitMQ to reconnect?"},
         database,
+        artifacts_dir,
         embedder,
     )
 
@@ -117,7 +118,7 @@ def test_cli_ingest_rebuilds_index_from_artifacts_alone_no_reextraction(tmp_path
     # No extractor passed — if ingest ever tried to re-extract, this would crash.
     exit_code = run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
     capsys.readouterr()
-    run(["search", "rabbitmq timeout", "--database", str(database)], embedder)
+    run(["search", "rabbitmq timeout", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder)
     output = capsys.readouterr().out
 
     assert exit_code == 0
@@ -134,7 +135,7 @@ def test_search_result_citation_resolves_to_the_exact_artifact_file(tmp_path):
     embedder = KeywordEmbedder()
     run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
 
-    results = search_episode_records(database, "rabbitmq", embedder)
+    results, _trace = search(database, artifacts_dir, "rabbitmq", embedder)
 
     assert len(results) == 1
     result = results[0]
@@ -156,7 +157,7 @@ def test_cli_ingest_indexes_only_active_revision(tmp_path, capsys):
 
     run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
     capsys.readouterr()
-    run(["search", "new question", "--database", str(database)], embedder)
+    run(["search", "new question", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder)
     output = capsys.readouterr().out
 
     assert "New question" in output
@@ -352,6 +353,7 @@ def test_hook_fails_open_when_database_does_not_exist(tmp_path):
     response = handle_user_prompt(
         {"hook_event_name": "UserPromptSubmit", "prompt": "Anything"},
         tmp_path / "missing.lance",
+        tmp_path / "artifacts",
         KeywordEmbedder(),
     )
 
@@ -454,7 +456,7 @@ def test_rejected_records_excluded_from_search_but_visible_via_history(tmp_path,
     capsys.readouterr()
     run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
     capsys.readouterr()
-    run(["search", "rabbitmq", "--database", str(database)], embedder)
+    run(["search", "rabbitmq", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder)
     search_output = capsys.readouterr().out
 
     assert "RabbitMQ heartbeat issue" not in search_output
@@ -486,7 +488,7 @@ def test_verification_state_survives_lancedb_rebuild(tmp_path, capsys):
     shutil.rmtree(database)
     run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
     capsys.readouterr()
-    run(["search", "rabbitmq postgres", "--database", str(database)], embedder)
+    run(["search", "rabbitmq postgres", "--database", str(database), "--artifacts", str(artifacts_dir)], embedder)
     output = capsys.readouterr().out
 
     assert "RabbitMQ heartbeat issue" not in output
