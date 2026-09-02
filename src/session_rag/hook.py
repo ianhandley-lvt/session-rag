@@ -24,6 +24,11 @@ class HookConfig:
     retrieval_timeout_ms: int = 500
     max_injected_tokens: int = 1000
     max_injected_records: int = 3
+    # A small, SEPARATE budget from retrieval_timeout_ms — metrics recording
+    # is strictly best-effort bookkeeping, never allowed to add unbounded
+    # latency to the hook path even if retrieval already used its full
+    # budget (see _record_metric_best_effort).
+    metrics_timeout_ms: int = 100
 
     @classmethod
     def from_env(cls) -> "HookConfig":
@@ -39,10 +44,14 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _location_suffix(result: dict) -> str:
-    location = result.get("evidence_location")
-    if location is None or location < 0:
+    # The stable Evidence Location identifier, never a sanitized-rendering
+    # line count — a line number would misleadingly imply a position in the
+    # (unpersisted, per-extraction) sanitized text, not a durable pointer
+    # into the source revision.
+    location_id = result.get("evidence_location_id")
+    if not location_id:
         return ""
-    return f", line {location}"
+    return f", evidence {location_id}"
 
 
 def _format_record(index: int, result: dict) -> str:
@@ -147,6 +156,29 @@ def _record_metric(artifacts_root: Path, *, latency_ms: float, outcome: str, res
     )
 
 
+def _record_metric_best_effort(
+    artifacts_root: Path, *, latency_ms: float, outcome: str, result_count: int, timeout_seconds: float
+) -> None:
+    """Metrics recording is strictly best-effort bookkeeping: bounded by its
+    own small, fixed timeout — independent of how much of retrieval_timeout_ms
+    the search/format work already used, and never itself allowed to add
+    unbounded latency to the hook path (a hung filesystem write must not be
+    able to delay prompt submission indefinitely). Runs through the same
+    daemon-thread timeout as retrieval (see _run_with_timeout), so a slow
+    writer is abandoned rather than awaited — reliable in the normal
+    (near-instant) case, silently dropped only in the pathological one.
+    Any failure — timeout or a genuine write error — is swallowed: metrics
+    must never change or delay the hook's actual response."""
+
+    try:
+        _run_with_timeout(
+            timeout_seconds, _record_metric, artifacts_root,
+            latency_ms=latency_ms, outcome=outcome, result_count=result_count,
+        )
+    except Exception:
+        pass
+
+
 def handle_user_prompt(
     event: dict,
     database: Path,
@@ -205,7 +237,13 @@ def handle_user_prompt(
             outcome = "error"
 
     latency_ms = (time.monotonic() - started) * 1000
-    _record_metric(artifacts_root, latency_ms=latency_ms, outcome=outcome, result_count=len(results))
+    _record_metric_best_effort(
+        artifacts_root,
+        latency_ms=latency_ms,
+        outcome=outcome,
+        result_count=len(results),
+        timeout_seconds=config.metrics_timeout_ms / 1000,
+    )
 
     if not context:
         return {}

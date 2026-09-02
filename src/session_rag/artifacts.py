@@ -112,11 +112,24 @@ def job_status_path(root: Path, *, source_type: SourceType, source_id: str) -> P
 
 
 def write_job_status(
-    root: Path, *, source_type: SourceType, source_id: str, status: JobStatus, reason: str, attempted_hash: str
+    root: Path,
+    *,
+    source_type: SourceType,
+    source_id: str,
+    status: JobStatus,
+    reason: str,
+    attempted_hash: str,
+    project_id: str | None = None,
 ) -> None:
     """Non-sensitive metadata identifying which source revision needs a
     retry — no transcript content, no secrets. Retained until the next
-    successful extraction of this source clears it."""
+    successful extraction of this source clears it.
+
+    `project_id` records which project (if any) the attempt was configured
+    for — the only way a later project-scoped forget can tell whether this
+    status belongs to the project being erased. A failed/blocked/
+    pending_retry attempt never produces an Episode Record, so it never
+    gets Project Provenance any other way."""
 
     path = job_status_path(root, source_type=source_type, source_id=source_id)
     atomic_write_json(
@@ -126,6 +139,7 @@ def write_job_status(
             "reason": reason,
             "attempted_hash": attempted_hash,
             "attempted_at": datetime.now(timezone.utc).isoformat(),
+            "project_id": project_id,
         },
     )
 
@@ -252,11 +266,18 @@ def forget_source(root: Path, source_id: str, *, project_id: str | None = None) 
 
         if remaining_hashes:
             # Other-project revisions survive — clear the active pointer
-            # only if the revision it names was actually deleted; job
-            # status isn't attributable to a single project, so it's left
-            # alone whenever any revision survives.
+            # only if the revision it names was actually deleted.
             if active_hash not in remaining_hashes:
                 active_revision_path(root, source_type=source_type, source_id=source_id).unlink(missing_ok=True)
+            # Job status is attributed by the project_id recorded on it at
+            # attempt time (see write_job_status) — clear it only when that
+            # matches the project being forgotten. An attempt with no
+            # recorded project (or a different, surviving one) is left
+            # alone: there's no way to prove it belongs to the project
+            # being forgotten, and erasure must never over-delete.
+            job_path = job_status_path(root, source_type=source_type, source_id=source_id)
+            if job_path.exists() and read_json(job_path).get("project_id") == project_id:
+                job_path.unlink(missing_ok=True)
         else:
             shutil.rmtree(source_dir)
     return record_ids, active_revision_removed

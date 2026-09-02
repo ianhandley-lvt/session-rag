@@ -25,6 +25,30 @@ class Attribution(BaseModel):
     citation: ShortText
 
 
+class EvidenceLocation(BaseModel):
+    """A stable pointer into the exact source revision an Episode Record's
+    claim is drawn from — application-resolved, never trusted as the model
+    proposed it (see CursorExtractor and sanitize.SanitizedSession).
+
+    `identifier` is the sanitizer's own per-turn identifier: the source
+    transcript's own stable id for that turn when it provides one, or a
+    deterministic position in the immutable raw file otherwise. Either way
+    it names one whole source turn, never a position in the transient,
+    per-extraction sanitized *rendering* — that shifts whenever a turn is
+    skipped or renders as more than one line, which is exactly the failure
+    mode this replaces.
+
+    `preserved_text` is a snapshot of that turn's sanitized text captured at
+    extraction time, so a citation stays resolvable even after the live
+    transcript at `StructuredRecord.source` has since changed or been
+    deleted — resolution never re-reads the live source."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    identifier: ShortText
+    preserved_text: NonEmptyText
+
+
 class ExtractedKnowledge(BaseModel):
     """Model-generated fields. Trusted provenance is deliberately absent."""
 
@@ -38,11 +62,13 @@ class ExtractedKnowledge(BaseModel):
     attribution: Attribution | None = None
     temporal_scope: TemporalScope | None = None
     timestamp: datetime | None = None
-    # 0-indexed line number in the sanitized transcript that supports this
-    # record. Model-proposed, application-validated (see CursorExtractor):
-    # rejected (set to null) if it falls outside the sanitized content's
-    # actual line range — never trusted as-is.
-    evidence_location: int | None = None
+    # The model's raw pick of one of the identifiers the sanitizer exposed
+    # in transcript_data — an opaque string, never itself trusted. The model
+    # may only select from identifiers the sanitizer produced; it must never
+    # invent one. Application code resolves this into a full EvidenceLocation
+    # (or discards it if it names no real entry) before constructing a
+    # StructuredRecord — see CursorExtractor.extract.
+    evidence_location: str | None = None
 
 
 class ProjectProvenance(BaseModel):
@@ -73,6 +99,11 @@ class StructuredRecord(ExtractedKnowledge):
     operator_id: ShortText
     project: ProjectProvenance | None = None
     prompt_version: int
+    # Overrides ExtractedKnowledge.evidence_location (a bare model-proposed
+    # str) with the application-resolved EvidenceLocation object — same
+    # field name as the draft, reprocessed by application code before a
+    # StructuredRecord is ever constructed (see CursorExtractor.extract).
+    evidence_location: EvidenceLocation | None = None
 
 
 class ExtractionResult(BaseModel):
