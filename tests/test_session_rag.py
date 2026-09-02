@@ -1,10 +1,12 @@
 import json
+import shutil
 from pathlib import Path
 
-from session_rag.artifacts import job_status_path, read_active_hash
+from session_rag.artifacts import artifact_path, job_status_path, read_active_hash
 from session_rag.cli import run
 from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry
 from session_rag.hook import handle_user_prompt
+from session_rag.store import search_episode_records
 
 from conftest import make_record
 
@@ -37,54 +39,48 @@ class KeywordEmbedder:
         ]
 
 
-def write_session(path: Path) -> None:
-    records = [
-        {
-            "type": "user",
-            "sessionId": "session-123",
-            "timestamp": "2026-08-26T10:00:00Z",
-            "message": {"role": "user", "content": "Why did RabbitMQ reconnect?"},
-        },
-        {
-            "type": "assistant",
-            "sessionId": "session-123",
-            "timestamp": "2026-08-26T10:01:00Z",
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": "The heartbeat timeout caused the reconnect."},
-                    {"type": "tool_use", "name": "Bash", "input": {"command": "secret"}},
-                ],
-            },
-        },
-    ]
-    path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
+def _extract_and_activate(artifacts_dir, transcript, content, question, summary):
+    transcript.write_text(json.dumps({"type": "user", "message": {"content": content}}) + "\n")
+    record = make_record(question=question, summary=summary, source=str(transcript.resolve()), source_session_id=transcript.stem)
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts_dir)], extractor=FakeExtractor([record]))
 
 
-def test_cli_ingests_sessions_and_returns_cited_search_results(tmp_path, capsys):
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
-    write_session(sessions / "session-123.jsonl")
+def test_cli_ingests_from_artifacts_and_returns_cited_search_results(tmp_path, capsys):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
     database = tmp_path / "memory.lance"
+    _extract_and_activate(
+        artifacts_dir,
+        transcript,
+        "why did rabbitmq reconnect",
+        question="Why did RabbitMQ reconnect?",
+        summary="The heartbeat timeout caused the reconnect.",
+    )
     embedder = KeywordEmbedder()
+    capsys.readouterr()
 
-    assert run(["ingest-sessions", str(sessions), "--database", str(database)], embedder) == 0
+    assert run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder) == 0
     capsys.readouterr()
     assert run(["search", "rabbitmq timeout", "--database", str(database)], embedder) == 0
 
     output = capsys.readouterr().out
     assert "heartbeat timeout caused the reconnect" in output
-    assert "session-123.jsonl" in output
-    assert "secret" not in output
+    assert "session-123" in output
 
 
 def test_user_prompt_hook_returns_additional_context(tmp_path):
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
-    write_session(sessions / "session-123.jsonl")
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
     database = tmp_path / "memory.lance"
+    _extract_and_activate(
+        artifacts_dir,
+        transcript,
+        "why did rabbitmq reconnect",
+        question="Why did RabbitMQ reconnect?",
+        summary="The heartbeat timeout caused the reconnect.",
+    )
     embedder = KeywordEmbedder()
-    run(["ingest-sessions", str(sessions), "--database", str(database)], embedder)
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
 
     response = handle_user_prompt(
         {"hook_event_name": "UserPromptSubmit", "prompt": "What caused RabbitMQ to reconnect?"},
@@ -96,7 +92,73 @@ def test_user_prompt_hook_returns_additional_context(tmp_path):
     context = response["hookSpecificOutput"]["additionalContext"]
     assert "Retrieved local session memory" in context
     assert "heartbeat timeout" in context
-    assert "session-123.jsonl" in context
+    assert "session-123" in context
+
+
+def test_cli_ingest_rebuilds_index_from_artifacts_alone_no_reextraction(tmp_path, capsys):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    _extract_and_activate(
+        artifacts_dir,
+        transcript,
+        "why did rabbitmq reconnect",
+        question="Why did RabbitMQ reconnect?",
+        summary="The heartbeat timeout caused the reconnect.",
+    )
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    shutil.rmtree(database)
+    capsys.readouterr()
+
+    # No extractor passed — if ingest ever tried to re-extract, this would crash.
+    exit_code = run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+    capsys.readouterr()
+    run(["search", "rabbitmq timeout", "--database", str(database)], embedder)
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "heartbeat timeout caused the reconnect" in output
+
+
+def test_search_result_citation_resolves_to_the_exact_artifact_file(tmp_path):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    _extract_and_activate(
+        artifacts_dir, transcript, "why did rabbitmq reconnect", question="Q", summary="RabbitMQ heartbeat"
+    )
+    embedder = KeywordEmbedder()
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+
+    results = search_episode_records(database, "rabbitmq", embedder)
+
+    assert len(results) == 1
+    result = results[0]
+    active_hash = read_active_hash(artifacts_dir, source_type=result["source_type"], source_id=result["source_id"])
+    resolved_path = artifact_path(
+        artifacts_dir, source_type=result["source_type"], source_id=result["source_id"], hash_value=active_hash
+    )
+    assert resolved_path.exists()
+    assert result["source_hash"] == active_hash
+
+
+def test_cli_ingest_indexes_only_active_revision(tmp_path, capsys):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    _extract_and_activate(artifacts_dir, transcript, "v1", question="Old question", summary="Old summary")
+    _extract_and_activate(artifacts_dir, transcript, "v2", question="New question", summary="New summary")
+    embedder = KeywordEmbedder()
+
+    run(["ingest", "--artifacts", str(artifacts_dir), "--database", str(database)], embedder)
+    capsys.readouterr()
+    run(["search", "new question", "--database", str(database)], embedder)
+    output = capsys.readouterr().out
+
+    assert "New question" in output
+    assert "Old question" not in output
 
 
 def test_cli_extract_session_reports_blocked_for_oversized_session(tmp_path, capsys, monkeypatch):

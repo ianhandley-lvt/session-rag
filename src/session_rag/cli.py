@@ -5,20 +5,20 @@ import json
 import sys
 from pathlib import Path
 
+from .artifacts import load_active_episode_records
 from .embeddings import FastEmbedder
 from .extractors import create_extractor
 from .extractors.base import KnowledgeExtractor
 from .hook import format_context, handle_user_prompt
 from .pipeline import run_extraction
-from .store import Embedder, index_memories, search_memories
-from .transcripts import load_sessions
+from .store import Embedder, index_episode_records, search_episode_records
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="session-rag")
     commands = result.add_subparsers(dest="command", required=True)
-    ingest = commands.add_parser("ingest-sessions")
-    ingest.add_argument("directory", type=Path)
+    ingest = commands.add_parser("ingest")
+    ingest.add_argument("--artifacts", type=Path, required=True)
     ingest.add_argument("--database", type=Path, required=True)
     extract = commands.add_parser("extract-session")
     extract.add_argument("transcript", type=Path)
@@ -40,10 +40,11 @@ def run(
     extractor: KnowledgeExtractor | None = None,
 ) -> int:
     args = parser().parse_args(arguments)
-    if args.command == "ingest-sessions":
+    if args.command == "ingest":
         selected_embedder = embedder or FastEmbedder()
-        count = index_memories(args.database, load_sessions(args.directory), selected_embedder)
-        print(f"Indexed {count} session memories in {args.database}")
+        records = load_active_episode_records(args.artifacts)
+        count = index_episode_records(args.database, records, selected_embedder)
+        print(f"Indexed {count} episode records in {args.database}")
     elif args.command == "extract-session":
         try:
             selected_extractor = extractor or create_extractor(
@@ -85,7 +86,7 @@ def run(
         )
     elif args.command == "search":
         selected_embedder = embedder or FastEmbedder()
-        results = search_memories(args.database, args.query, selected_embedder)
+        results = search_episode_records(args.database, args.query, selected_embedder)
         print(format_context(results) if results else "No relevant session memory found.")
     elif args.command == "hook":
         selected_embedder = embedder or FastEmbedder()

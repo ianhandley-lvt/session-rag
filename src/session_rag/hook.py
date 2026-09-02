@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .store import Embedder, search_memories
+from .store import Embedder, search_episode_records
 
 
 def format_context(results: list[dict]) -> str:
@@ -10,7 +10,9 @@ def format_context(results: list[dict]) -> str:
     for index, result in enumerate(results, start=1):
         sections.append(
             f"[{index}] {result['text']}\n"
-            f"Source: {result['source']} (session {result['session_id']}, {result['timestamp']})"
+            f"Source: {result['source']} "
+            f"(artifact {result['source_type']}/{result['source_id']}/{result['source_hash']}, "
+            f"{result['timestamp']})"
         )
     return "\n\n".join(sections)
 
@@ -20,7 +22,7 @@ def handle_user_prompt(event: dict, database: Path, embedder: Embedder) -> dict:
     if event.get("hook_event_name") != "UserPromptSubmit" or not prompt:
         return {}
     try:
-        results = search_memories(database, prompt, embedder)
+        results = search_episode_records(database, prompt, embedder)
     except Exception:
         return {}
     if not results:
