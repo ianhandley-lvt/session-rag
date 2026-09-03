@@ -16,7 +16,7 @@ class Embedder(Protocol):
     def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
-def _retrieval_text(record: dict) -> str:
+def retrieval_text(record: dict) -> str:
     """Assembled from question/summary/resolution/systems/code_references —
     the fields a search over durable knowledge should match against, not the
     raw conversational transcript."""
@@ -40,7 +40,7 @@ def index_episode_records(database: Path, records: list[dict], embedder: Embedde
     if not records:
         return 0
     database.mkdir(parents=True, exist_ok=True)
-    texts = [_retrieval_text(record) for record in records]
+    texts = [retrieval_text(record) for record in records]
     vectors = embedder.embed(texts)
     rows = [
         {

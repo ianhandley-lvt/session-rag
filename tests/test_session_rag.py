@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from session_rag.artifacts import artifact_path, find_record, job_status_path, read_active_hash
+from session_rag.artifacts import artifact_path, find_record, job_status_path, load_active_episode_records, read_active_hash
 from session_rag.cli import run
 from session_rag.extractors.base import (
     EvidenceLocation,
@@ -179,7 +179,14 @@ def test_cli_capture_latest_extracts_newest_registered_project_session_and_index
 
     result = json.loads(capsys.readouterr().out)
     assert extractor.last_transcript == latest
-    assert result == {"status": "activated", "session_id": "latest", "records": 1, "indexed": 1}
+    assert result == {
+        "status": "activated",
+        "session_id": "latest",
+        "records": 1,
+        "indexed": 1,
+        "exact_duplicates": 0,
+        "possible_duplicates": 0,
+    }
     assert run(["--config", str(config_path), "search", "rabbitmq", "--project-id", "lvcore"], KeywordEmbedder()) == 0
     assert "RabbitMQ latest session evidence" in capsys.readouterr().out
 
@@ -1558,3 +1565,101 @@ def test_import_sessions_resume_does_not_silently_process_a_changed_revision(tmp
     assert run(["--config", str(config), "import-sessions", "--project", "lvcore", "--resume"], KeywordEmbedder(), failed) == 0
     assert failed.calls == 1
     assert json.loads(capsys.readouterr().out)["changed_since_failure"] == 1
+
+
+def test_ingest_skips_exact_normalized_duplicates_and_preserves_duplicate_link(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    project = ProjectProvenance(project_id="lvcore")
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first.write_text('{"type":"user","message":{"content":"first"}}\n')
+    second.write_text('{"type":"user","message":{"content":"second"}}\n')
+    shared = dict(
+        question="Where are the LVCore logs?",
+        summary="  They are in CLOUDWATCH. ",
+        resolution="Use the camerarelay log group.",
+        project=project,
+    )
+    run(["extract-session", str(first), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+        make_record(**shared, source=str(first), source_session_id="first")
+    ]))
+    run(["extract-session", str(second), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+        make_record(**{**shared, "summary": "they are in cloudwatch."}, source=str(second), source_session_id="second")
+    ]))
+    records = load_active_episode_records(artifacts)
+    first_id = next(record["id"] for record in records if record["source_id"] == "first")
+    second_id = next(record["id"] for record in records if record["source_id"] == "second")
+    capsys.readouterr()
+
+    assert run(["ingest", "--artifacts", str(artifacts), "--database", str(database)], KeywordEmbedder()) == 0
+    assert "Indexed 1 episode records" in capsys.readouterr().out
+    run(["history", second_id, "--artifacts", str(artifacts)])
+    state = json.loads(capsys.readouterr().out)
+    assert state["duplicate_of"] == first_id
+    assert state["duplicate_review_status"] == "exact"
+    run(["duplicates", "--project-id", "lvcore", "--artifacts", str(artifacts)])
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_ingest_flags_semantic_matches_for_review_without_removing_them(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    project = ProjectProvenance(project_id="lvcore")
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first.write_text('{"type":"user","message":{"content":"first"}}\n')
+    second.write_text('{"type":"user","message":{"content":"second"}}\n')
+    run(["extract-session", str(first), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+        make_record(question="Why did RabbitMQ reconnect?", summary="A heartbeat timeout caused it.", source=str(first), source_session_id="first", project=project)
+    ]))
+    run(["extract-session", str(second), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+        make_record(question="What caused the RabbitMQ connection reset?", summary="The broker missed its heartbeat.", source=str(second), source_session_id="second", project=project)
+    ]))
+    records = load_active_episode_records(artifacts)
+    first_id = next(record["id"] for record in records if record["source_id"] == "first")
+    second_id = next(record["id"] for record in records if record["source_id"] == "second")
+    capsys.readouterr()
+
+    run(["ingest", "--artifacts", str(artifacts), "--database", str(database)], KeywordEmbedder())
+    assert "Indexed 2 episode records" in capsys.readouterr().out
+    run(["history", second_id, "--artifacts", str(artifacts)])
+    state = json.loads(capsys.readouterr().out)
+    assert state["duplicate_of"] is None
+    assert state["duplicate_review_status"] == "possible"
+    assert state["reinforces"][0]["record_id"] == first_id
+    run(["duplicates", "--project-id", "lvcore", "--artifacts", str(artifacts)])
+    queue = json.loads(capsys.readouterr().out)
+    assert [item["record_id"] for item in queue] == [second_id]
+
+
+def test_ingest_never_deduplicates_identical_episodes_across_projects(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    for name, project_id in (("first", "lvcore"), ("second", "beacon")):
+        transcript = tmp_path / f"{name}.jsonl"
+        transcript.write_text('{"type":"user","message":{"content":"same"}}\n')
+        run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+            make_record(question="Where are logs?", summary="CloudWatch", source=str(transcript), source_session_id=name, project=ProjectProvenance(project_id=project_id))
+        ]))
+    capsys.readouterr()
+
+    run(["ingest", "--artifacts", str(artifacts), "--database", str(database)], KeywordEmbedder())
+
+    assert "Indexed 2 episode records" in capsys.readouterr().out
+
+
+def test_ingest_does_not_compare_records_without_trusted_project_provenance(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    for name in ("first", "second"):
+        transcript = tmp_path / f"{name}.jsonl"
+        transcript.write_text('{"type":"user","message":{"content":"same"}}\n')
+        run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+            make_record(question="Where are logs?", summary="CloudWatch", source=str(transcript), source_session_id=name)
+        ]))
+    capsys.readouterr()
+
+    run(["ingest", "--artifacts", str(artifacts), "--database", str(database)], KeywordEmbedder())
+
+    assert "Indexed 2 episode records" in capsys.readouterr().out

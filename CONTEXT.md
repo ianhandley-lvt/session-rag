@@ -70,6 +70,18 @@ _Avoid_: Latest revision (implies mere recency, not the atomic all-or-nothing sw
 The versioned, immutable JSON envelope holding all Episode Records produced from one source revision — keyed by source ID and source hash so re-extraction never destroys a prior revision. The durable, replayable input to the LanceDB index; LanceDB itself stays a rebuildable derived index, never the system of record. See [ADR-0001](docs/adr/0001-extraction-artifacts-are-the-system-of-record.md).
 _Avoid_: Extraction result, cache (implies disposable; this is durable), vector row, index row
 
+**Exact Duplicate**:
+An Episode Record whose normalized knowledge fields have the same fingerprint as an older record in the same trusted project. It remains in its immutable artifact with a `duplicate_of` provenance link, but is omitted from retrieval automatically.
+_Avoid_: Deleting the artifact, semantic duplicate (exactness is deterministic)
+
+**Possible Duplicate**:
+An Episode Record whose embedding is highly similar to an older, non-identical record in the same trusted project. It remains retrievable and receives a scored `reinforces` link plus a review flag; semantic similarity never deletes or merges it automatically.
+_Avoid_: Exact Duplicate, automatic merge
+
+**Duplicate Review Queue**:
+The project-filterable list produced by `memory duplicates`. It contains Possible Duplicates requiring human judgment, not Exact Duplicates already handled deterministically.
+_Avoid_: Exact duplicate list, deletion queue
+
 **Evidence Location**:
 A stable, source-adapter-issued pointer into the exact source revision an Episode Record's claim is drawn from, beyond source type/ID/hash alone: an `identifier` meaningful within that source revision plus `preserved_text`, a sanitized snapshot of the cited evidence captured at import time. For a Claude session, the identifier is the source's per-turn ID when present or a deterministic raw-file position; for a Markdown Knowledge Base, it is the heading path plus occurrence/part when needed. An LLM may only select an identifier the source adapter supplied for that revision — application code rejects invented identifiers — and never supplies `preserved_text` itself. Deterministic adapters assign both fields directly. The location is persisted inside the Episode Record's immutable Extraction Artifact, so a citation stays resolvable after the live source changes or is deleted; resolution never depends on re-reading the live source.
 _Avoid_: Sanitized line number (the transient rendering it replaces — not stable, not preserved, not what the citation should ever display)

@@ -34,7 +34,13 @@ def _real_record_id(root, hash_value="sha256:real"):
 
 
 def test_read_state_defaults_to_unreviewed(tmp_path):
-    assert read_state(tmp_path, "sha256:abc:0") == {"verification_status": "unreviewed", "superseded_by": None}
+    assert read_state(tmp_path, "sha256:abc:0") == {
+        "verification_status": "unreviewed",
+        "superseded_by": None,
+        "duplicate_of": None,
+        "reinforces": [],
+        "duplicate_review_status": None,
+    }
 
 
 def test_verify_from_unreviewed(tmp_path):

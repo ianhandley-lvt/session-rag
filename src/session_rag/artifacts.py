@@ -168,6 +168,7 @@ def _denormalize(record: dict, envelope: dict) -> dict:
         "source_type": envelope["source_type"],
         "source_id": envelope["source_id"],
         "source_hash": envelope["source_hash"],
+        "extracted_at": envelope.get("extracted_at", ""),
     }
 
 

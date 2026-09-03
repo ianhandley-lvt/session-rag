@@ -21,7 +21,9 @@ flowchart LR
     E --> R[Episode Records]
     D --> R
     R --> F[Immutable artifacts<br/>source of derived memory]
-    F --> I[LanceDB index<br/>semantic + exact-text search]
+    F --> U[Exact + semantic<br/>duplicate analysis]
+    U --> I
+    I[LanceDB index<br/>semantic + exact-text search]
     P[Your Claude prompt] --> H[UserPromptSubmit hook]
     H --> I
     I --> K[Ranked, project-scoped evidence<br/>with citations]
@@ -276,6 +278,7 @@ unscoped Cursor conversations.
 | Search one project | `memory search "question" --project-id ID` |
 | Search everything | `memory search "question" --global-scope` |
 | Inspect a record and its status | `memory history RECORD_ID` |
+| Review duplicate candidates | `memory duplicates --project-id ID` |
 | Mark a record trustworthy | `memory verify RECORD_ID` |
 | Remove a bad record from retrieval | `memory reject RECORD_ID` |
 | Replace an old record | `memory supersede OLD_RECORD_ID NEW_RECORD_ID` |
@@ -290,6 +293,10 @@ source hash, and evidence location needed to trace a result back to its source.
 ## How records are treated
 
 - New records begin as `unreviewed` and remain searchable.
+- Exact normalized duplicates receive a `duplicate_of` link and are omitted
+  from the index; their immutable source evidence is retained.
+- Probable semantic duplicates remain searchable and receive scored
+  `reinforces` links for review with `memory duplicates`.
 - `verified` records receive a ranking boost.
 - `rejected` and `superseded` records remain in history but leave retrieval.
 - Durable verified knowledge resists time decay; time-sensitive observations

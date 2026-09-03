@@ -74,6 +74,12 @@ import. Cursor is read through a temporary, read-only database snapshot.
 Because its project fingerprint is opaque, Cursor conversations are imported
 without project provenance and require `--global-scope` during retrieval.
 
+Each index rebuild automatically skips exact normalized duplicates inside the
+same project and flags probable semantic matches without removing them. Inspect
+the review queue with `memory duplicates --project-id PROJECT_ID`. Tune the
+provisional cosine floor with `MEMORY_SEMANTIC_DUPLICATE_THRESHOLD` (default
+`0.92`) only against evaluated examples.
+
 `capture` refuses to run unless the selected project ID and root match a
 project registered in the TOML file. This prevents an environment variable
 from silently attaching one project's provenance to another project's

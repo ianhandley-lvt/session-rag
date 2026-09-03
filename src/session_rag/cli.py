@@ -11,6 +11,7 @@ from pathlib import Path
 from .app_config import ConfigError, ResolvedAppConfig, load_app_config, resolve_app_config
 from .artifacts import artifact_path, find_record, find_sources_by_project, forget_source, load_active_episode_records, source_hash
 from .embeddings import FastEmbedder
+from .deduplication import DEFAULT_SEMANTIC_DUPLICATE_THRESHOLD, reconcile_duplicates
 from .extractors import create_extractor
 from .extractors.cursor import CursorExtractor
 from .extractors.base import KnowledgeExtractor, ProjectProvenance
@@ -101,6 +102,9 @@ def parser() -> argparse.ArgumentParser:
     _add_record_command_args(supersede_cmd)
     supersede_cmd.add_argument("replacement_id")
     _add_record_command_args(commands.add_parser("history"))
+    duplicates = commands.add_parser("duplicates")
+    duplicates.add_argument("--project-id")
+    duplicates.add_argument("--artifacts", type=Path)
     forget_cmd = commands.add_parser("forget")
     forget_cmd.add_argument("source_id", nargs="?")
     forget_cmd.add_argument("--project")
@@ -219,6 +223,14 @@ def _forget_sources(artifacts_root: Path, database: Path, source_ids: list[str],
     return total
 
 
+def _index_active_records(artifacts: Path, database: Path, embedder: Embedder) -> tuple[int, int, int]:
+    records = load_active_episode_records(artifacts)
+    threshold = float(env_value("SEMANTIC_DUPLICATE_THRESHOLD", str(DEFAULT_SEMANTIC_DUPLICATE_THRESHOLD)))
+    deduplication = reconcile_duplicates(artifacts, records, embedder, semantic_threshold=threshold)
+    count = index_episode_records(database, filter_retrievable(artifacts, records), embedder)
+    return count, deduplication.exact_duplicates, deduplication.possible_duplicates
+
+
 def run(
     arguments: list[str] | None = None,
     embedder: Embedder | None = None,
@@ -249,9 +261,8 @@ def run(
 
     if args.command == "ingest":
         selected_embedder = embedder or FastEmbedder()
-        records = filter_retrievable(artifacts, load_active_episode_records(artifacts))
-        count = index_episode_records(database, records, selected_embedder)
-        print(f"Indexed {count} episode records in {database}")
+        count, exact, possible = _index_active_records(artifacts, database, selected_embedder)
+        print(f"Indexed {count} episode records in {database} ({exact} exact duplicate(s) skipped, {possible} possible duplicate(s) flagged)")
     elif args.command == "capture":
         try:
             registered_project = _capture_project(app_config, resolved)
@@ -284,8 +295,7 @@ def run(
             return 1
 
         selected_embedder = embedder or FastEmbedder()
-        active_records = filter_retrievable(artifacts, load_active_episode_records(artifacts))
-        indexed = index_episode_records(database, active_records, selected_embedder)
+        indexed, exact_duplicates, possible_duplicates = _index_active_records(artifacts, database, selected_embedder)
         envelope = json.loads(outcome.artifact_path.read_text())
         print(
             json.dumps(
@@ -294,6 +304,8 @@ def run(
                     "session_id": transcript.stem,
                     "records": len(envelope["episode_records"]),
                     "indexed": indexed,
+                    "exact_duplicates": exact_duplicates,
+                    "possible_duplicates": possible_duplicates,
                 }
             )
         )
@@ -358,8 +370,9 @@ def run(
                 )
                 counts[{"no_op": "unchanged"}.get(outcome.status, outcome.status)] += 1
             selected_embedder = embedder or FastEmbedder()
-            records = filter_retrievable(artifacts, load_active_episode_records(artifacts))
-            counts["indexed"] = index_episode_records(database, records, selected_embedder)
+            counts["indexed"], counts["exact_duplicates"], counts["possible_duplicates"] = _index_active_records(
+                artifacts, database, selected_embedder
+            )
         print(json.dumps(counts, indent=2))
         if cursor_temporary is not None:
             cursor_temporary.cleanup()
@@ -488,6 +501,26 @@ def run(
             print(json.dumps(result))
         except Exception:
             print("{}")
+    elif args.command == "duplicates":
+        review_items = []
+        for record in load_active_episode_records(artifacts):
+            project_id = (record.get("project") or {}).get("project_id")
+            if args.project_id and project_id != args.project_id:
+                continue
+            state = read_state(artifacts, record["id"])
+            if state["duplicate_review_status"] == "possible":
+                review_items.append(
+                    {
+                        "record_id": record["id"],
+                        "question": record["question"],
+                        "project_id": project_id,
+                        "source": record["source"],
+                        "duplicate_of": state["duplicate_of"],
+                        "reinforces": state["reinforces"],
+                        "duplicate_review_status": state["duplicate_review_status"],
+                    }
+                )
+        print(json.dumps(review_items, indent=2))
     elif args.command in {"verify", "reject", "supersede", "history"}:
         record = find_record(artifacts, args.record_id)
         if record is None:

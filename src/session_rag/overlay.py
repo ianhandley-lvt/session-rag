@@ -2,12 +2,24 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 from .artifacts import find_record
 from .jsonio import atomic_write_json, read_json
 
 VerificationStatus = Literal["unreviewed", "verified", "rejected", "superseded"]
+DuplicateReviewStatus = Literal["exact", "possible"]
+
+
+class ReinforcementLink(TypedDict):
+    record_id: str
+    similarity: float
+
+
+class DuplicateStateUpdate(TypedDict):
+    duplicate_of: str | None
+    reinforces: list[ReinforcementLink]
+    duplicate_review_status: DuplicateReviewStatus | None
 
 EXCLUDED_FROM_SEARCH: frozenset[VerificationStatus] = frozenset({"rejected", "superseded"})
 
@@ -16,7 +28,13 @@ _ALLOWED_TRANSITIONS: dict[VerificationStatus, frozenset[VerificationStatus]] = 
     "verified": frozenset({"rejected", "superseded"}),
 }
 
-DEFAULT_STATE: dict = {"verification_status": "unreviewed", "superseded_by": None}
+DEFAULT_STATE: dict = {
+    "verification_status": "unreviewed",
+    "superseded_by": None,
+    "duplicate_of": None,
+    "reinforces": [],
+    "duplicate_review_status": None,
+}
 
 
 class InvalidTransition(ValueError):
@@ -50,16 +68,33 @@ def read_state(root: Path, record_id: str) -> dict:
     disposable derived index) — surviving a full LanceDB rebuild is exactly
     the property this storage exists to guarantee."""
 
-    return _read_overlay(root).get(record_id, dict(DEFAULT_STATE))
+    return {**DEFAULT_STATE, **_read_overlay(root).get(record_id, {})}
+
+
+def read_states(root: Path, record_ids: list[str]) -> dict[str, dict]:
+    """Read lifecycle and duplicate state for a corpus with one file parse."""
+
+    overlay = _read_overlay(root)
+    return {record_id: {**DEFAULT_STATE, **overlay.get(record_id, {})} for record_id in record_ids}
 
 
 def _write_state(root: Path, record_id: str, status: VerificationStatus, superseded_by: str | None) -> None:
     overlay = _read_overlay(root)
     overlay[record_id] = {
+        **overlay.get(record_id, {}),
         "verification_status": status,
         "superseded_by": superseded_by,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+    atomic_write_json(overlay_path(root), overlay)
+
+
+def write_duplicate_states(root: Path, updates: dict[str, DuplicateStateUpdate]) -> None:
+    """Atomically replace derived duplicate metadata for a corpus rebuild."""
+    overlay = _read_overlay(root)
+    checked_at = datetime.now(timezone.utc).isoformat()
+    for record_id, update in updates.items():
+        overlay[record_id] = {**overlay.get(record_id, {}), **update, "duplicate_checked_at": checked_at}
     atomic_write_json(overlay_path(root), overlay)
 
 
@@ -96,8 +131,21 @@ def forget_records(root: Path, record_ids: list[str]) -> None:
         return
     overlay = _read_overlay(root)
     changed = False
+    forgotten = set(record_ids)
     for record_id in record_ids:
         if overlay.pop(record_id, None) is not None:
+            changed = True
+    for state in overlay.values():
+        if state.get("duplicate_of") in forgotten:
+            state["duplicate_of"] = None
+            state["duplicate_review_status"] = None
+            changed = True
+        original = state.get("reinforces", [])
+        remaining = [link for link in original if link.get("record_id") not in forgotten]
+        if remaining != original:
+            state["reinforces"] = remaining
+            if not remaining and state.get("duplicate_review_status") == "possible":
+                state["duplicate_review_status"] = None
             changed = True
     if changed:
         atomic_write_json(overlay_path(root), overlay)
@@ -108,4 +156,10 @@ def filter_retrievable(root: Path, records: list[dict]) -> list[dict]:
     excluded records still exist in their (immutable) artifact and remain
     reachable via history lookup, just not through normal search."""
 
-    return [record for record in records if read_state(root, record["id"])["verification_status"] not in EXCLUDED_FROM_SEARCH]
+    overlay = _read_overlay(root)
+    retrievable = []
+    for record in records:
+        state = {**DEFAULT_STATE, **overlay.get(record["id"], {})}
+        if state["verification_status"] not in EXCLUDED_FROM_SEARCH and state["duplicate_of"] is None:
+            retrievable.append(record)
+    return retrievable
