@@ -3,13 +3,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 
 from .app_config import ConfigError, ResolvedAppConfig, load_app_config, resolve_app_config
-from .artifacts import find_record, find_sources_by_project, forget_source, load_active_episode_records
+from .artifacts import artifact_path, find_record, find_sources_by_project, forget_source, load_active_episode_records, source_hash
 from .embeddings import FastEmbedder
 from .extractors import create_extractor
+from .extractors.cursor import CursorExtractor
 from .extractors.base import KnowledgeExtractor, ProjectProvenance
 from .hook import format_context, handle_user_prompt
 from .markdown_kb import MarkdownKnowledgeBaseExtractor, markdown_articles, markdown_source_id
@@ -29,6 +32,8 @@ from .retrieval import RetrievalScope
 from .retrieval import purge_traces
 from .retrieval import search as retrieval_search
 from .store import Embedder, delete_by_source_id, index_episode_records
+from .session_sources import claude_sessions, cursor_sessions, parse_since
+from .envconfig import env_value
 
 
 def _add_record_command_args(subparser: argparse.ArgumentParser) -> None:
@@ -44,8 +49,8 @@ def _add_storage_args(subparser: argparse.ArgumentParser, *, database: bool = Tr
 
 def _add_scope_args(subparser: argparse.ArgumentParser) -> None:
     # Deliberately CLI/env-only — never derived from the query/prompt text
-    # itself (ADR-0004). Unset means "fall back to SESSION_RAG_PROJECT_ID /
-    # SESSION_RAG_GLOBAL_SCOPE" (RetrievalScope.from_env()).
+    # itself (ADR-0004). Unset means "fall back to MEMORY_PROJECT_ID /
+    # MEMORY_GLOBAL_SCOPE" (RetrievalScope.from_env()).
     subparser.add_argument("--project-id")
     subparser.add_argument("--global-scope", action="store_true", default=None)
 
@@ -54,14 +59,14 @@ def _scope_from_args(args: argparse.Namespace, resolved: ResolvedAppConfig) -> R
     if args.project_id is None and args.global_scope is None:
         return RetrievalScope(
             project_id=resolved.project_id,
-            global_scope=os.getenv("SESSION_RAG_GLOBAL_SCOPE", "").lower() == "true",
+            global_scope=env_value("GLOBAL_SCOPE", "").lower() == "true",
         )
     return RetrievalScope(project_id=args.project_id, global_scope=bool(args.global_scope))
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="session-rag")
-    result.add_argument("--config", type=Path, help="TOML config path (default: ~/.config/session-rag/config.toml)")
+    result = argparse.ArgumentParser(prog="memory")
+    result.add_argument("--config", type=Path, help="TOML config path (default: ~/.config/memory/config.toml)")
     commands = result.add_subparsers(dest="command", required=True)
     ingest = commands.add_parser("ingest")
     _add_storage_args(ingest)
@@ -100,6 +105,19 @@ def parser() -> argparse.ArgumentParser:
     forget_cmd.add_argument("source_id", nargs="?")
     forget_cmd.add_argument("--project")
     _add_storage_args(forget_cmd)
+    capture = commands.add_parser("capture")
+    capture.add_argument("--latest", action="store_true", required=True)
+    capture.add_argument("--project-id")
+    capture.add_argument("--project-root")
+    batch = commands.add_parser("import-sessions")
+    batch.add_argument("--source", choices=["claude", "cursor", "all"], default="claude")
+    project_selection = batch.add_mutually_exclusive_group()
+    project_selection.add_argument("--project")
+    project_selection.add_argument("--configured-projects", action="store_true")
+    batch.add_argument("--dry-run", action="store_true")
+    batch.add_argument("--since", help="Only sessions updated on/after YYYY-MM-DD")
+    batch.add_argument("--resume", action="store_true", help="Retry only previously failed or blocked sessions")
+    batch.add_argument("--cursor-database", type=Path)
     config_cmd = commands.add_parser("config")
     config_commands = config_cmd.add_subparsers(dest="config_command", required=True)
     config_commands.add_parser("show")
@@ -126,7 +144,7 @@ def _require(value, name: str):
     if value is None:
         raise ConfigError(
             f"{name} is required; pass --{name.replace('_', '-')} or configure it in "
-            "~/.config/session-rag/config.toml"
+            "~/.config/memory/config.toml"
         )
     return value
 
@@ -149,6 +167,33 @@ def _config_display(resolved: ResolvedAppConfig) -> dict:
             "knowledge_base": str(resolved.knowledge_base) if resolved.knowledge_base else None,
         },
     }
+
+
+def _latest_claude_transcript(project_root: Path) -> Path:
+    claude_home = Path(os.getenv("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+    encoded_project = re.sub(r"[^A-Za-z0-9_-]", "-", str(project_root.resolve()))
+    transcript_dir = claude_home / "projects" / encoded_project
+    transcripts = list(transcript_dir.glob("*.jsonl")) if transcript_dir.is_dir() else []
+    if not transcripts:
+        raise ConfigError(f"no Claude transcripts found for {project_root} in {transcript_dir}")
+    return max(transcripts, key=lambda transcript: transcript.stat().st_mtime_ns)
+
+
+def _capture_project(app_config, resolved: ResolvedAppConfig):
+    if not resolved.project_id:
+        raise ConfigError("capture requires a project selected by the current directory or --project-id")
+    registered = app_config.projects.get(resolved.project_id)
+    if registered is None:
+        raise ConfigError(
+            f"project {resolved.project_id!r} is not registered in the config; "
+            "capture will not infer transcript provenance from an unregistered environment value"
+        )
+    if resolved.project_root is None or resolved.project_root.resolve() != registered.root.resolve():
+        raise ConfigError(
+            f"resolved root for project {resolved.project_id!r} does not match its registered config root "
+            f"{registered.root}"
+        )
+    return registered
 
 
 def _forget_sources(artifacts_root: Path, database: Path, source_ids: list[str], *, project_id: str | None = None) -> int:
@@ -195,7 +240,7 @@ def run(
         artifacts = _require(resolved.artifacts, "artifacts")
         database = (
             _require(resolved.database, "database")
-            if args.command in {"ingest", "search", "hook", "forget"}
+            if args.command in {"ingest", "search", "hook", "forget", "capture", "import-sessions"}
             else resolved.database
         )
     except ConfigError as error:
@@ -207,6 +252,117 @@ def run(
         records = filter_retrievable(artifacts, load_active_episode_records(artifacts))
         count = index_episode_records(database, records, selected_embedder)
         print(f"Indexed {count} episode records in {database}")
+    elif args.command == "capture":
+        try:
+            registered_project = _capture_project(app_config, resolved)
+            transcript = _latest_claude_transcript(registered_project.root)
+            project = ProjectProvenance(
+                project_id=resolved.project_id,
+                project_root=str(registered_project.root),
+            )
+            selected_extractor = extractor or create_extractor(
+                resolved.extractor_provider,
+                cursor_mode=resolved.cursor_mode,
+                cursor_model=resolved.cursor_model,
+                max_sanitized_chars=resolved.max_sanitized_chars,
+                operator_id=resolved.operator_id,
+                project=project,
+            )
+        except (ConfigError, ValueError) as error:
+            print(f"configuration error: {error}", file=sys.stderr)
+            return 3
+
+        outcome = run_extraction(selected_extractor, transcript, artifacts)
+        if outcome.status == "blocked":
+            print(f"blocked: {outcome.reason}", file=sys.stderr)
+            return 2
+        if outcome.status == "pending_retry":
+            print(f"pending_retry: {outcome.reason}", file=sys.stderr)
+            return 4
+        if outcome.status == "failed":
+            print(f"failed: {outcome.reason}", file=sys.stderr)
+            return 1
+
+        selected_embedder = embedder or FastEmbedder()
+        active_records = filter_retrievable(artifacts, load_active_episode_records(artifacts))
+        indexed = index_episode_records(database, active_records, selected_embedder)
+        envelope = json.loads(outcome.artifact_path.read_text())
+        print(
+            json.dumps(
+                {
+                    "status": outcome.status,
+                    "session_id": transcript.stem,
+                    "records": len(envelope["episode_records"]),
+                    "indexed": indexed,
+                }
+            )
+        )
+    elif args.command == "import-sessions":
+        if args.project and args.source in {"cursor", "all"}:
+            print("configuration error: Cursor sessions cannot yet be assigned trusted project provenance", file=sys.stderr)
+            return 3
+        if args.project and args.project not in app_config.projects:
+            print(f"configuration error: project {args.project!r} is not registered", file=sys.stderr)
+            return 3
+        try:
+            cutoff = parse_since(args.since)
+        except ValueError:
+            print("configuration error: --since must be an ISO date such as 2026-09-01", file=sys.stderr)
+            return 3
+        sources = []
+        if args.source in {"claude", "all"}:
+            claude_home = Path(os.getenv("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+            sources.extend(claude_sessions(app_config.projects, claude_home, args.project))
+        cursor_temporary = None
+        if args.source in {"cursor", "all"}:
+            cursor_db = args.cursor_database or Path.home() / "Library/Application Support/Cursor/User/globalStorage/conversation-search.db"
+            # Normalized Cursor rows are transient extraction input. The
+            # immutable artifact preserves cited evidence; retaining another
+            # plaintext copy would make `forget` incomplete.
+            cursor_temporary = tempfile.TemporaryDirectory()
+            cursor_output = Path(cursor_temporary.name)
+            sources.extend(cursor_sessions(cursor_db, cursor_output))
+        if cutoff is not None:
+            sources = [source for source in sources if source.updated_at is None or source.updated_at >= cutoff]
+
+        counts = {"discovered": len(sources), "eligible": 0, "activated": 0, "unchanged": 0, "changed_since_failure": 0, "blocked": 0, "failed": 0, "pending_retry": 0}
+        candidates = []
+        for source in sources:
+            hash_value = source_hash(source.path)
+            existing = artifact_path(artifacts, source_type=source.source_type, source_id=source.source_id, hash_value=hash_value).exists()
+            status_file = artifacts / source.source_type / source.source_id / "job_status.json"
+            if args.resume:
+                if not status_file.exists():
+                    continue
+                attempted_hash = json.loads(status_file.read_text()).get("attempted_hash")
+                if attempted_hash != hash_value:
+                    counts["changed_since_failure"] += 1
+                    continue
+            if not args.resume and existing:
+                counts["unchanged"] += 1
+                continue
+            candidates.append(source)
+        counts["eligible"] = len(candidates)
+        if not args.dry_run:
+            for source in candidates:
+                project = ProjectProvenance(project_id=source.project_id, project_root=str(source.project_root)) if source.project_id else None
+                selected = extractor or CursorExtractor(
+                    mode=resolved.cursor_mode, model=resolved.cursor_model,
+                    max_sanitized_chars=resolved.max_sanitized_chars,
+                    operator_id=resolved.operator_id, project=project,
+                    source_type=source.source_type, source_id=source.source_id, source_uri=source.source_uri,
+                )
+                outcome = run_extraction(
+                    selected, source.path, artifacts,
+                    source_type=source.source_type, source_id=source.source_id, source_uri=source.source_uri,
+                )
+                counts[{"no_op": "unchanged"}.get(outcome.status, outcome.status)] += 1
+            selected_embedder = embedder or FastEmbedder()
+            records = filter_retrievable(artifacts, load_active_episode_records(artifacts))
+            counts["indexed"] = index_episode_records(database, records, selected_embedder)
+        print(json.dumps(counts, indent=2))
+        if cursor_temporary is not None:
+            cursor_temporary.cleanup()
     elif args.command == "import-markdown-kb":
         wiki_dir = args.wiki_dir or resolved.knowledge_base
         project_id = args.project_id or resolved.project_id
@@ -257,9 +413,9 @@ def run(
                 ProjectProvenance(
                     project_id=resolved.project_id,
                     project_root=str(resolved.project_root) if resolved.project_root else None,
-                    repository_revision=os.getenv("SESSION_RAG_REPOSITORY_REVISION") or None,
-                    working_tree_dirty=(os.getenv("SESSION_RAG_WORKING_TREE_DIRTY", "").lower() == "true")
-                    if os.getenv("SESSION_RAG_WORKING_TREE_DIRTY")
+                    repository_revision=env_value("REPOSITORY_REVISION") or None,
+                    working_tree_dirty=(env_value("WORKING_TREE_DIRTY", "").lower() == "true")
+                    if env_value("WORKING_TREE_DIRTY")
                     else None,
                 )
                 if resolved.project_id

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import hashlib
 from dataclasses import dataclass
@@ -8,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .extractors.base import ExtractionBlocked, EvidenceLocation, ProjectProvenance, StructuredRecord, TemporalScope
+from .envconfig import env_value
 
 MAX_SECTION_CHARS = 3_000
 NAVIGATION_FILES = frozenset({"INDEX.md", "QUESTIONS.md"})
@@ -149,7 +149,7 @@ def _document_metadata(markdown: str) -> tuple[str | None, list[str]]:
 
 
 def _configured(value: str | None, env_name: str) -> str:
-    resolved = value or os.getenv(env_name, "")
+    resolved = value or env_value(env_name.removeprefix("SESSION_RAG_"), "")
     if not resolved:
         raise ValueError(f"{env_name} must be configured")
     return resolved

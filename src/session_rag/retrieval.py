@@ -9,7 +9,7 @@ from pathlib import Path
 import lancedb
 
 from .artifacts import read_active_hash
-from .envconfig import config_from_env
+from .envconfig import config_from_env, env_value
 from .jsonio import append_json_line
 from .overlay import EXCLUDED_FROM_SEARCH, read_state
 from .store import Embedder, TABLE_NAME
@@ -29,8 +29,8 @@ class RetrievalScope:
     @classmethod
     def from_env(cls) -> "RetrievalScope":
         return cls(
-            project_id=os.getenv("SESSION_RAG_PROJECT_ID") or None,
-            global_scope=os.getenv("SESSION_RAG_GLOBAL_SCOPE", "").lower() == "true",
+            project_id=env_value("PROJECT_ID") or None,
+            global_scope=env_value("GLOBAL_SCOPE", "").lower() == "true",
         )
 
     def permits(self, candidate_project_id: str) -> bool:

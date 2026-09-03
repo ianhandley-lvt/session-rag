@@ -72,6 +72,7 @@ def run_extraction(
     *,
     source_type: SourceType = "claude_session",
     source_id: str | None = None,
+    source_uri: str | None = None,
 ) -> ExtractionOutcome:
     """Extract, persist, and activate one source revision — or record why it
     didn't happen. Never writes a partial artifact and never moves the
@@ -128,7 +129,7 @@ def run_extraction(
         artifacts_root,
         source_type=source_type,
         source_id=source_id,
-        source_uri=str(transcript.resolve()),
+        source_uri=source_uri or str(transcript.resolve()),
         hash_value=hash_value,
         extractor=extractor.name,
         extractor_model=extractor.model,

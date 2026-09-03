@@ -1,5 +1,7 @@
 import json
+import re
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -32,9 +34,11 @@ class FakeExtractor:
         # it was configured for (see write_job_status).
         self.project_id = project_id
         self.calls = 0
+        self.last_transcript = None
 
     def extract(self, transcript):
         self.calls += 1
+        self.last_transcript = transcript
         if self._error:
             raise self._error
         return self._records
@@ -130,6 +134,106 @@ def test_cli_config_show_reports_effective_project_for_current_directory(tmp_pat
     assert shown["operator_id"] == "ian"
     assert shown["extractor"]["max_sanitized_chars"] == 500000
     assert shown["project"] == {"id": "lvcore", "root": str(project_root), "knowledge_base": None}
+
+
+def test_cli_capture_latest_extracts_newest_registered_project_session_and_indexes_it(
+    tmp_path, capsys, monkeypatch
+):
+    project_root = tmp_path / "lvcore"
+    project_root.mkdir()
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project_root.resolve()))
+    transcript_dir.mkdir(parents=True)
+    older = transcript_dir / "older.jsonl"
+    latest = transcript_dir / "latest.jsonl"
+    older.write_text('{"type":"user","message":{"content":"old"}}\n')
+    latest.write_text('{"type":"user","message":{"content":"rabbitmq latest"}}\n')
+    older.touch()
+    latest.touch()
+    older_mtime = latest.stat().st_mtime - 10
+    import os
+
+    os.utime(older, (older_mtime, older_mtime))
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{artifacts}"\n'
+        f'database = "{database}"\n'
+        'operator_id = "ian"\n'
+        '[projects.lvcore]\n'
+        f'root = "{project_root}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.chdir(project_root)
+    record = make_record(
+        question="What was learned?",
+        summary="RabbitMQ latest session evidence.",
+        source=str(latest.resolve()),
+        source_session_id="latest",
+        project=ProjectProvenance(project_id="lvcore", project_root=str(project_root)),
+    )
+    extractor = FakeExtractor([record], project_id="lvcore")
+
+    assert run(["--config", str(config_path), "capture", "--latest"], KeywordEmbedder(), extractor) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert extractor.last_transcript == latest
+    assert result == {"status": "activated", "session_id": "latest", "records": 1, "indexed": 1}
+    assert run(["--config", str(config_path), "search", "rabbitmq", "--project-id", "lvcore"], KeywordEmbedder()) == 0
+    assert "RabbitMQ latest session evidence" in capsys.readouterr().out
+
+
+def test_cli_capture_rejects_project_not_registered_in_config(tmp_path, capsys, monkeypatch):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n'
+        'operator_id = "ian"\n'
+        '[projects.lvcore]\n'
+        f'root = "{tmp_path / "lvcore"}"\n'
+    )
+    monkeypatch.setenv("SESSION_RAG_PROJECT_ID", "session-rag")
+    monkeypatch.setenv("SESSION_RAG_PROJECT_ROOT", str(tmp_path / "session-rag"))
+    extractor = FakeExtractor([], project_id="session-rag")
+
+    assert run(["--config", str(config_path), "capture", "--latest"], KeywordEmbedder(), extractor) == 3
+
+    assert extractor.calls == 0
+    assert "is not registered in the config" in capsys.readouterr().err
+
+
+def test_cli_capture_latest_is_no_op_for_unchanged_active_session(tmp_path, capsys, monkeypatch):
+    project_root = tmp_path / "lvcore"
+    project_root.mkdir()
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project_root.resolve()))
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "session-1.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"knowledge"}}\n')
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n'
+        'operator_id = "ian"\n'
+        '[projects.lvcore]\n'
+        f'root = "{project_root}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.chdir(project_root)
+    record = make_record(
+        source=str(transcript.resolve()),
+        source_session_id="session-1",
+        project=ProjectProvenance(project_id="lvcore", project_root=str(project_root)),
+    )
+    extractor = FakeExtractor([record], project_id="lvcore")
+
+    assert run(["--config", str(config_path), "capture", "--latest"], KeywordEmbedder(), extractor) == 0
+    capsys.readouterr()
+    assert run(["--config", str(config_path), "capture", "--latest"], KeywordEmbedder(), extractor) == 0
+
+    assert extractor.calls == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "no_op"
 
 
 def test_user_prompt_hook_returns_additional_context(tmp_path):
@@ -1346,3 +1450,111 @@ def test_forget_requires_exactly_one_of_source_id_or_project(tmp_path):
     exit_code = run(["forget", "--artifacts", str(artifacts_dir), "--database", str(database)])
 
     assert exit_code == 1
+
+
+def test_import_sessions_dry_run_discovers_all_configured_claude_projects(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    claude_home = tmp_path / ".claude"
+    project_a = tmp_path / "a"
+    project_b = tmp_path / "b"
+    for project, session_id in ((project_a, "one"), (project_b, "two")):
+        transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+        transcript_dir.mkdir(parents=True)
+        (transcript_dir / f"{session_id}.jsonl").write_text('{"type":"user","message":{"content":"hello"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{database}"\n'
+        f'[projects.a]\nroot = "{project_a}"\n[projects.b]\nroot = "{project_b}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--configured-projects", "--dry-run"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["discovered"] == 2
+
+
+def test_import_sessions_project_filter_and_resume_are_safe(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    claude_home = tmp_path / ".claude"
+    project = tmp_path / "lvcore"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "one.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"hello"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{database}"\n'
+        f'[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    record = make_record(source=str(transcript), source_session_id="one", project=ProjectProvenance(project_id="lvcore"))
+    fake = FakeExtractor([record], project_id="lvcore")
+
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--project", "lvcore"], KeywordEmbedder(), fake) == 0
+    assert fake.calls == 1
+    capsys.readouterr()
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--project", "lvcore", "--resume"], KeywordEmbedder(), fake) == 0
+    assert fake.calls == 1
+    assert json.loads(capsys.readouterr().out)["eligible"] == 0
+
+
+def test_import_sessions_cursor_uses_only_local_rows_and_keeps_them_unscoped(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    cursor_db = tmp_path / "conversation-search.db"
+    with sqlite3.connect(cursor_db) as connection:
+        connection.execute("CREATE TABLE conversations (fts_rowid INTEGER PRIMARY KEY, id TEXT, title TEXT, source TEXT, updated_at REAL)")
+        connection.execute("CREATE TABLE conversation_fts (title TEXT, body TEXT)")
+        connection.executemany(
+            "INSERT INTO conversations VALUES (?, ?, ?, ?, ?)",
+            [(1, "local-one", "Local", "local", 1), (2, "cloud-copy", "Cloud", "cloud-cache", 2)],
+        )
+        connection.executemany(
+            "INSERT INTO conversation_fts VALUES (?, ?)",
+            [("Local", "local conversation"), ("Cloud", "duplicated cloud conversation")],
+        )
+    config = tmp_path / "config.toml"
+    config.write_text(f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{database}"\n')
+
+    assert run(["--config", str(config), "import-sessions", "--source", "cursor", "--cursor-database", str(cursor_db), "--dry-run"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["discovered"] == 1
+    assert not (artifacts / ".source-snapshots").exists()
+
+
+def test_import_sessions_rejects_project_filter_when_cursor_is_included(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{tmp_path / "artifacts"}"\ndatabase = "{tmp_path / "database"}"\n'
+        f'[projects.lvcore]\nroot = "{tmp_path / "lvcore"}"\n'
+    )
+
+    assert run(["--config", str(config), "import-sessions", "--source", "all", "--project", "lvcore"]) == 3
+    assert "cannot yet be assigned trusted project provenance" in capsys.readouterr().err
+
+
+def test_import_sessions_resume_does_not_silently_process_a_changed_revision(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    claude_home = tmp_path / ".claude"
+    project = tmp_path / "lvcore"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "one.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"first"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{tmp_path / "database"}"\n'
+        f'[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    failed = FakeExtractor(error=ExtractionPendingRetry("quota"), project_id="lvcore")
+    run(["--config", str(config), "import-sessions", "--project", "lvcore"], KeywordEmbedder(), failed)
+    transcript.write_text('{"type":"user","message":{"content":"changed"}}\n')
+    capsys.readouterr()
+
+    assert run(["--config", str(config), "import-sessions", "--project", "lvcore", "--resume"], KeywordEmbedder(), failed) == 0
+    assert failed.calls == 1
+    assert json.loads(capsys.readouterr().out)["changed_since_failure"] == 1

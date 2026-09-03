@@ -1,4 +1,4 @@
-# Session RAG v1 Design Decisions
+# Memory v1 Design Decisions
 
 **Status:** Implemented. v1 acceptance criteria are complete — see closed [issue #1](https://github.com/ianhandley-lvt/session-rag/issues/1) and merged PR #19.<br>
 **Decided:** 2026-09-01 · **Implemented:** 2026-09-02<br>
@@ -8,7 +8,7 @@ This is the readable, consolidated statement of the agreed v1 design. For the or
 
 ## Purpose
 
-Session RAG turns useful knowledge created during Claude Code sessions into durable, structured evidence that can be retrieved during later work. It is intended to recover decisions, explanations, resolved problems, and current-system observations without treating an entire raw conversation as trustworthy memory.
+Memory turns useful knowledge created during Claude Code sessions into durable, structured evidence that can be retrieved during later work. It is intended to recover decisions, explanations, resolved problems, and current-system observations without treating an entire raw conversation as trustworthy memory.
 
 The v1 pipeline will:
 
@@ -143,9 +143,9 @@ The extractor initializes new Episode Records as `unreviewed`. It may not promot
 Only an explicit operator action may change Verification Status. The intended CLI surface is conceptually:
 
 ```text
-session-rag verify <record-id>
-session-rag reject <record-id>
-session-rag supersede <old-record-id> <replacement-record-id>
+memory verify <record-id>
+memory reject <record-id>
+memory supersede <old-record-id> <replacement-record-id>
 ```
 
 Supersession requires a replacement record ID so the provenance chain remains navigable.
@@ -192,8 +192,8 @@ Activating a source revision does not alter any Episode Record's Verification St
 Deletion in v1 is explicit and manual:
 
 ```text
-session-rag forget <source-id>
-session-rag forget --project <project-id>
+memory forget <source-id>
+memory forget --project <project-id>
 ```
 
 An explicit erasure removes:

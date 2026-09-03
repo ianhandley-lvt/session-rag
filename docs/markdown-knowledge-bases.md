@@ -2,7 +2,7 @@
 
 **Status:** Implemented
 
-Session RAG can import a curated Markdown Wiki without sending it through Cursor. This path is intended for knowledge bases that already contain synthesized articles, meaningful headings, dates, and citations to original material.
+Memory can import a curated Markdown Wiki without sending it through Cursor. This path is intended for knowledge bases that already contain synthesized articles, meaningful headings, dates, and citations to original material.
 
 ## Source contract
 
@@ -23,25 +23,25 @@ The source type is `markdown_knowledge_base`. The deterministic adapter is recor
 ## Import and index
 
 ```bash
-uv run session-rag import-markdown-kb /path/to/knowledge-base/Wiki \
+uv run memory import-markdown-kb /path/to/knowledge-base/Wiki \
   --knowledge-base-id lvcore \
   --project-id lvcore \
   --project-root /path/to/lvcore \
-  --artifacts ~/.local/share/session-rag/artifacts
+  --artifacts ~/.local/share/memory/artifacts
 
-uv run session-rag ingest \
-  --artifacts ~/.local/share/session-rag/artifacts \
-  --database ~/.local/share/session-rag/lancedb
+uv run memory ingest \
+  --artifacts ~/.local/share/memory/artifacts \
+  --database ~/.local/share/memory/lancedb
 ```
 
-`SESSION_RAG_OPERATOR_ID` supplies the operator unless `--operator-id` is passed. Import is idempotent: unchanged article content reuses the existing artifact, while changed content produces and activates a new immutable revision.
+`MEMORY_OPERATOR_ID` supplies the operator unless `--operator-id` is passed. Import is idempotent: unchanged article content reuses the existing artifact, while changed content produces and activates a new immutable revision.
 
 ## Search
 
 ```bash
-uv run session-rag search "How do I find LVCore logs in CloudWatch?" \
-  --artifacts ~/.local/share/session-rag/artifacts \
-  --database ~/.local/share/session-rag/lancedb \
+uv run memory search "How do I find LVCore logs in CloudWatch?" \
+  --artifacts ~/.local/share/memory/artifacts \
+  --database ~/.local/share/memory/lancedb \
   --project-id lvcore
 ```
 

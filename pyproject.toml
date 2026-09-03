@@ -1,7 +1,7 @@
 [project]
-name = "claude-session-rag"
+name = "memory"
 version = "0.1.0"
-description = "Project-scoped local retrieval for Claude Code session history"
+description = "Local evidence memory for AI work sessions and curated knowledge"
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "fastembed>=0.7,<0.8",
@@ -9,6 +9,7 @@ dependencies = [
 ]
 
 [project.scripts]
+memory = "session_rag.cli:main"
 session-rag = "session_rag.cli:main"
 
 [dependency-groups]

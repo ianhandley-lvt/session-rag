@@ -1,13 +1,13 @@
 # Configuration
 
-Session RAG reads `~/.config/session-rag/config.toml` by default. Set
-`SESSION_RAG_CONFIG` or pass the global `--config PATH` option to select a
+Memory reads `~/.config/memory/config.toml` by default. Set
+`MEMORY_CONFIG` or pass the global `--config PATH` option to select a
 different file.
 
 Configuration precedence is:
 
 1. Command-line option
-2. `SESSION_RAG_*` environment variable
+2. `MEMORY_*` environment variable (`SESSION_RAG_*` remains a compatibility alias)
 3. TOML configuration
 4. Built-in default
 
@@ -15,8 +15,8 @@ The initial schema is:
 
 ```toml
 operator_id = "ian"
-artifacts = "/Users/ian.handley/.local/share/session-rag/artifacts"
-database = "/Users/ian.handley/.local/share/session-rag/lancedb"
+artifacts = "/Users/ian.handley/.local/share/memory/artifacts"
+database = "/Users/ian.handley/.local/share/memory/lancedb"
 
 [extractor]
 provider = "cursor"
@@ -29,20 +29,52 @@ root = "/Users/ian.handley/src/work/lvcore"
 knowledge_base = "/Users/ian.handley/src/personal/second-brain/lvcore_kb/Wiki"
 ```
 
-When the current directory is inside a configured project root, Session RAG
+When the current directory is inside a configured project root, Memory
 selects the most specific matching project. Prompt text can never select or
 widen this Retrieval Scope.
 
 Inspect the effective configuration for the current directory with:
 
 ```sh
-session-rag config show
+memory config show
 ```
 
 With storage paths configured, commands no longer need repeated `--artifacts`
 or `--database` options:
 
 ```sh
-session-rag ingest
-session-rag search "Where are LVCore logs?"
+memory ingest
+memory search "Where are LVCore logs?"
 ```
+
+Capture the newest Claude session for the configured current project and
+rebuild the index in one command:
+
+```sh
+cd /Users/ian.handley/src/work/lvcore
+memory capture --latest
+```
+
+## Batch ingestion
+
+Preview first, then remove `--dry-run` to extract and index:
+
+```sh
+memory import-sessions --source claude --configured-projects --dry-run
+memory import-sessions --source claude --project lvcore --since 2026-09-01 --dry-run
+memory import-sessions --source cursor --dry-run
+memory import-sessions --source all --dry-run
+memory import-sessions --source all --resume
+```
+
+The batch continues past individual failures and rebuilds the index once at
+the end. Resume never silently retries a different mutable revision: changed
+sources are reported as `changed_since_failure` and require a fresh normal
+import. Cursor is read through a temporary, read-only database snapshot.
+Because its project fingerprint is opaque, Cursor conversations are imported
+without project provenance and require `--global-scope` during retrieval.
+
+`capture` refuses to run unless the selected project ID and root match a
+project registered in the TOML file. This prevents an environment variable
+from silently attaching one project's provenance to another project's
+transcript.

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
+from .envconfig import ENV_PREFIX, LEGACY_ENV_PREFIX
+
 
 class ConfigError(ValueError):
     """The application configuration exists but is invalid."""
@@ -52,9 +54,16 @@ class ResolvedAppConfig:
 
 def default_config_path(environ: Mapping[str, str] | None = None) -> Path:
     env = environ if environ is not None else os.environ
-    configured = env.get("SESSION_RAG_CONFIG")
+    configured = env.get("MEMORY_CONFIG") or env.get("SESSION_RAG_CONFIG")
     if configured:
         return Path(configured).expanduser()
+    xdg_home = env.get("XDG_CONFIG_HOME")
+    base = Path(xdg_home).expanduser() if xdg_home else Path.home() / ".config"
+    return base / "memory" / "config.toml"
+
+
+def _legacy_config_path(environ: Mapping[str, str] | None = None) -> Path:
+    env = environ if environ is not None else os.environ
     xdg_home = env.get("XDG_CONFIG_HOME")
     base = Path(xdg_home).expanduser() if xdg_home else Path.home() / ".config"
     return base / "session-rag" / "config.toml"
@@ -87,6 +96,12 @@ def _integer(value: object, *, field_name: str, default: int) -> int:
 def load_app_config(path: Path | None = None, *, environ: Mapping[str, str] | None = None) -> AppConfig:
     explicit_path = path is not None
     selected_path = path.expanduser() if path is not None else default_config_path(environ)
+    env = environ if environ is not None else os.environ
+    has_explicit_env_path = bool(env.get("MEMORY_CONFIG") or env.get("SESSION_RAG_CONFIG"))
+    if not explicit_path and not has_explicit_env_path and not selected_path.exists():
+        legacy_path = _legacy_config_path(environ)
+        if legacy_path.exists():
+            selected_path = legacy_path
     if not selected_path.exists():
         if explicit_path:
             raise ConfigError(f"config file does not exist: {selected_path}")
@@ -158,6 +173,10 @@ def _first(*values):
     return next((value for value in values if value is not None and value != ""), None)
 
 
+def _env(env: Mapping[str, str], suffix: str) -> str | None:
+    return env.get(ENV_PREFIX + suffix) or env.get(LEGACY_ENV_PREFIX + suffix)
+
+
 def _resolved_path(value: object) -> Path | None:
     if value is None or value == "":
         return None
@@ -174,7 +193,7 @@ def resolve_app_config(
     env = environ if environ is not None else os.environ
     cli = explicit or {}
 
-    selected_project_id = _first(cli.get("project_id"), env.get("SESSION_RAG_PROJECT_ID"))
+    selected_project_id = _first(cli.get("project_id"), _env(env, "PROJECT_ID"))
     matched_id, matched_project = _project_for_cwd(config, cwd)
     if selected_project_id is None:
         selected_project_id = matched_id
@@ -182,14 +201,14 @@ def resolve_app_config(
     project_root = _resolved_path(
         _first(
             cli.get("project_root"),
-            env.get("SESSION_RAG_PROJECT_ROOT"),
+            _env(env, "PROJECT_ROOT"),
             configured_project.root if configured_project else None,
         )
     )
 
     max_chars_raw = _first(
         cli.get("max_sanitized_chars"),
-        env.get("SESSION_RAG_MAX_SANITIZED_CHARS"),
+        _env(env, "MAX_SANITIZED_CHARS"),
         config.extractor.max_sanitized_chars,
     )
     try:
@@ -201,14 +220,14 @@ def resolve_app_config(
 
     return ResolvedAppConfig(
         config_path=config.path,
-        operator_id=_first(cli.get("operator_id"), env.get("SESSION_RAG_OPERATOR_ID"), config.operator_id),
-        artifacts=_resolved_path(_first(cli.get("artifacts"), env.get("SESSION_RAG_ARTIFACTS"), config.artifacts)),
-        database=_resolved_path(_first(cli.get("database"), env.get("SESSION_RAG_DATABASE"), config.database)),
+        operator_id=_first(cli.get("operator_id"), _env(env, "OPERATOR_ID"), config.operator_id),
+        artifacts=_resolved_path(_first(cli.get("artifacts"), _env(env, "ARTIFACTS"), config.artifacts)),
+        database=_resolved_path(_first(cli.get("database"), _env(env, "DATABASE"), config.database)),
         extractor_provider=str(
-            _first(cli.get("extractor_provider"), env.get("SESSION_RAG_EXTRACTOR"), config.extractor.provider)
+            _first(cli.get("extractor_provider"), _env(env, "EXTRACTOR"), config.extractor.provider)
         ),
-        cursor_mode=str(_first(cli.get("cursor_mode"), env.get("SESSION_RAG_CURSOR_MODE"), config.extractor.mode)),
-        cursor_model=str(_first(cli.get("cursor_model"), env.get("SESSION_RAG_CURSOR_MODEL"), config.extractor.model)),
+        cursor_mode=str(_first(cli.get("cursor_mode"), _env(env, "CURSOR_MODE"), config.extractor.mode)),
+        cursor_model=str(_first(cli.get("cursor_model"), _env(env, "CURSOR_MODEL"), config.extractor.model)),
         max_sanitized_chars=max_chars,
         project_id=str(selected_project_id) if selected_project_id else None,
         project_root=project_root,

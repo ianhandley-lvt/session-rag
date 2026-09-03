@@ -7,7 +7,7 @@ from session_rag.extractors.base import StructuredRecord
 def isolate_personal_config(tmp_path, monkeypatch):
     """Tests never inherit the operator's real ~/.config/session-rag file."""
 
-    monkeypatch.setenv("SESSION_RAG_CONFIG", str(tmp_path / "missing-config.toml"))
+    monkeypatch.setenv("MEMORY_CONFIG", str(tmp_path / "missing-config.toml"))
 
 
 def make_record(**overrides) -> StructuredRecord:

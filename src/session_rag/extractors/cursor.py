@@ -21,6 +21,7 @@ from .base import (
     StructuredRecord,
 )
 from ..sanitize import DEFAULT_MAX_SANITIZED_CHARS, SanitizationBudgetExceeded, SanitizedSession, sanitize_session
+from ..envconfig import env_value
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -31,7 +32,8 @@ DEFAULT_MAX_OUTPUT_RETRIES = 1
 
 
 def _configured(value: str | None, env_var: str, default: str) -> str:
-    return value if value is not None else os.getenv(env_var, default)
+    suffix = env_var.removeprefix("SESSION_RAG_")
+    return value if value is not None else env_value(suffix, default)
 
 
 def _project_from_environment() -> ProjectProvenance | None:
@@ -39,14 +41,14 @@ def _project_from_environment() -> ProjectProvenance | None:
     never inferred (e.g. from Git). Absent entirely when no project_id is set —
     matches ProjectProvenance being optional outside a Git repo."""
 
-    project_id = os.getenv("SESSION_RAG_PROJECT_ID", "")
+    project_id = env_value("PROJECT_ID", "")
     if not project_id:
         return None
-    dirty_raw = os.getenv("SESSION_RAG_WORKING_TREE_DIRTY", "")
+    dirty_raw = env_value("WORKING_TREE_DIRTY", "")
     return ProjectProvenance(
         project_id=project_id,
-        project_root=os.getenv("SESSION_RAG_PROJECT_ROOT") or None,
-        repository_revision=os.getenv("SESSION_RAG_REPOSITORY_REVISION") or None,
+        project_root=env_value("PROJECT_ROOT") or None,
+        repository_revision=env_value("REPOSITORY_REVISION") or None,
         working_tree_dirty=(dirty_raw.lower() == "true") if dirty_raw else None,
     )
 
@@ -102,6 +104,9 @@ class CursorExtractor:
         project: ProjectProvenance | None = None,
         prompt_version: int | None = None,
         max_output_retries: int | None = None,
+        source_type: str = "claude_session",
+        source_id: str | None = None,
+        source_uri: str | None = None,
     ) -> None:
         self._executable = executable
         self._runner = runner
@@ -122,7 +127,7 @@ class CursorExtractor:
         if not self._operator_id:
             raise ValueError(
                 "operator_id must be configured explicitly (constructor arg or "
-                "SESSION_RAG_OPERATOR_ID) — it is never inferred from Git identity"
+                "MEMORY_OPERATOR_ID) — it is never inferred from Git identity"
             )
         self._project = project if project is not None else _project_from_environment()
         self._prompt_version = prompt_version or int(
@@ -131,6 +136,9 @@ class CursorExtractor:
         self._max_output_retries = max_output_retries or int(
             _configured(None, "SESSION_RAG_MAX_OUTPUT_RETRIES", str(DEFAULT_MAX_OUTPUT_RETRIES))
         )
+        self._source_type = source_type
+        self._source_id = source_id
+        self._source_uri = source_uri
 
     @property
     def model(self) -> str:
@@ -183,9 +191,9 @@ class CursorExtractor:
                         "attribution": _person_attribution(draft.attribution),
                         "evidence_location": _resolved_evidence_location(draft.evidence_location, sanitized),
                     },
-                    source=str(transcript.resolve()),
-                    source_session_id=transcript.stem,
-                    source_type="claude_session",
+                    source=self._source_uri or str(transcript.resolve()),
+                    source_session_id=self._source_id or transcript.stem,
+                    source_type=self._source_type,
                     operator_id=self._operator_id,
                     project=self._project,
                     prompt_version=self._prompt_version,

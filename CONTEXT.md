@@ -1,6 +1,6 @@
-# Session RAG
+# Memory
 
-Session RAG turns knowledge created in work sessions and other source systems into durable evidence that can be retrieved for later work.
+Memory turns knowledge created in work sessions and other source systems into durable evidence that can be retrieved for later work.
 
 ## Language
 
@@ -17,7 +17,7 @@ Immutable provenance category of an Episode Record's origin — `claude_session`
 _Avoid_: Authority (source type says where evidence came from, not how much to trust it)
 
 **Markdown Knowledge Base**:
-A curated collection of Markdown articles that already contains synthesized knowledge and source citations. It enters Session RAG through deterministic heading/paragraph parsing rather than an LLM extractor: each article is one source revision, and its meaningful sections become Episode Records. Navigation files are not evidence, and the knowledge base's RAW folder remains provenance rather than a second copy in the retrieval index.
+A curated collection of Markdown articles that already contains synthesized knowledge and source citations. It enters Memory through deterministic heading/paragraph parsing rather than an LLM extractor: each article is one source revision, and its meaningful sections become Episode Records. Navigation files are not evidence, and the knowledge base's RAW folder remains provenance rather than a second copy in the retrieval index.
 _Avoid_: Transcript (the content is already authored knowledge), raw-document chunking (section boundaries carry meaning), re-extraction
 
 **Verification Status**:

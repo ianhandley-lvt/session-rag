@@ -18,7 +18,7 @@ EvidenceText = Annotated[str, StringConstraints(strip_whitespace=True, min_lengt
 
 
 TemporalScope = Literal["durable", "time_sensitive"]
-SourceType = Literal["claude_session", "markdown_knowledge_base"]
+SourceType = Literal["claude_session", "cursor_session", "markdown_knowledge_base"]
 
 
 class Attribution(BaseModel):

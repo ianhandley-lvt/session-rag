@@ -28,9 +28,10 @@ knowledge_base = "/knowledge/lvcore/Wiki"
 
 
 def test_loads_default_config_from_xdg_config_home(tmp_path, monkeypatch):
-    config_path = tmp_path / "xdg" / "session-rag" / "config.toml"
+    config_path = tmp_path / "xdg" / "memory" / "config.toml"
     write_config(config_path)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("MEMORY_CONFIG", raising=False)
     monkeypatch.delenv("SESSION_RAG_CONFIG", raising=False)
 
     config = load_app_config()
@@ -39,6 +40,35 @@ def test_loads_default_config_from_xdg_config_home(tmp_path, monkeypatch):
     assert config.operator_id == "config-operator"
     assert config.extractor.max_sanitized_chars == 123456
     assert config.projects["lvcore"].root == Path("/work/lvcore")
+
+
+def test_memory_environment_overrides_legacy_session_rag_environment(tmp_path):
+    config_path = tmp_path / "config.toml"
+    write_config(config_path)
+    config = load_app_config(config_path)
+
+    resolved = resolve_app_config(
+        config,
+        cwd=Path("/work/lvcore"),
+        environ={
+            "MEMORY_OPERATOR_ID": "memory-operator",
+            "SESSION_RAG_OPERATOR_ID": "legacy-operator",
+        },
+    )
+
+    assert resolved.operator_id == "memory-operator"
+
+
+def test_legacy_config_is_loaded_when_canonical_config_does_not_exist(tmp_path, monkeypatch):
+    legacy = tmp_path / "xdg" / "session-rag" / "config.toml"
+    write_config(legacy)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("MEMORY_CONFIG", raising=False)
+    monkeypatch.delenv("SESSION_RAG_CONFIG", raising=False)
+
+    config = load_app_config()
+
+    assert config.path == legacy
 
 
 def test_explicit_missing_config_is_an_error(tmp_path):

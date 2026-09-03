@@ -2,7 +2,7 @@
 
 set -u
 
-if ! /Users/ian.handley/.local/bin/session-rag hook "$@"
+if ! /Users/ian.handley/.local/bin/memory hook "$@"
 then
   printf '{}\n'
 fi
