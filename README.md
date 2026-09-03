@@ -279,6 +279,8 @@ unscoped Cursor conversations.
 | Search everything | `memory search "question" --global-scope` |
 | Inspect a record and its status | `memory history RECORD_ID` |
 | Review duplicate candidates | `memory duplicates --project-id ID` |
+| Run a local knowledge audit | `memory health-check --project-id ID` |
+| Add Cursor contradiction/gap analysis | `memory health-check --project-id ID --ai` |
 | Mark a record trustworthy | `memory verify RECORD_ID` |
 | Remove a bad record from retrieval | `memory reject RECORD_ID` |
 | Replace an old record | `memory supersede OLD_RECORD_ID NEW_RECORD_ID` |
@@ -303,6 +305,32 @@ source hash, and evidence location needed to trace a result back to its source.
   lose ranking strength as they age.
 - Retrieval is project-scoped unless global scope is explicitly enabled.
 - Prompt text cannot widen its own scope.
+
+## Improve the knowledge base
+
+Run the fully local audit whenever you want a maintenance report:
+
+```sh
+memory health-check --project-id my-project
+```
+
+It reports possible duplicates or contradictions, stale time-sensitive records, missing evidence
+locations, failed ingestion jobs, and retrievals that returned nothing. Reports
+are saved under `artifacts/health-checks/PROJECT_ID/`. The command never changes
+or verifies records.
+
+For contradiction, coverage-gap, and suggested-article analysis, explicitly
+authorize one Cursor synthesis call:
+
+```sh
+memory health-check --project-id my-project --ai
+```
+
+This sends structured, previously sanitized Episode Record content to the
+configured Cursor model. It does not send raw transcripts or project-root
+paths. Suggested record links are accepted only when they resolve to real
+records in the selected project. Review the report, then use `verify`, `reject`,
+or `supersede` yourself; no recommendation is applied automatically.
 
 ## Troubleshooting
 

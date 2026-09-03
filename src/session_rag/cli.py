@@ -6,16 +6,18 @@ import os
 import re
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .app_config import ConfigError, ResolvedAppConfig, load_app_config, resolve_app_config
-from .artifacts import artifact_path, find_record, find_sources_by_project, forget_source, load_active_episode_records, source_hash
+from .artifacts import artifact_path, find_record, find_sources_by_project, forget_source, job_failures_for_project, load_active_episode_records, source_hash
 from .embeddings import FastEmbedder
 from .deduplication import DEFAULT_SEMANTIC_DUPLICATE_THRESHOLD, reconcile_duplicates
 from .extractors import create_extractor
 from .extractors.cursor import CursorExtractor
 from .extractors.base import KnowledgeExtractor, ProjectProvenance
 from .hook import format_context, handle_user_prompt
+from .health import CursorHealthChecker, HealthChecker, deterministic_findings, grounded_findings, write_report
 from .markdown_kb import MarkdownKnowledgeBaseExtractor, markdown_articles, markdown_source_id
 from .overlay import (
     InvalidTransition,
@@ -105,6 +107,11 @@ def parser() -> argparse.ArgumentParser:
     duplicates = commands.add_parser("duplicates")
     duplicates.add_argument("--project-id")
     duplicates.add_argument("--artifacts", type=Path)
+    health = commands.add_parser("health-check")
+    health.add_argument("--project-id", required=True)
+    health.add_argument("--ai", action="store_true", help="Send structured Episode Records to Cursor for synthesis")
+    health.add_argument("--stale-days", type=int, default=90)
+    health.add_argument("--artifacts", type=Path)
     forget_cmd = commands.add_parser("forget")
     forget_cmd.add_argument("source_id", nargs="?")
     forget_cmd.add_argument("--project")
@@ -235,6 +242,7 @@ def run(
     arguments: list[str] | None = None,
     embedder: Embedder | None = None,
     extractor: KnowledgeExtractor | None = None,
+    health_checker: HealthChecker | None = None,
 ) -> int:
     args = parser().parse_args(arguments)
     try:
@@ -521,6 +529,59 @@ def run(
                     }
                 )
         print(json.dumps(review_items, indent=2))
+    elif args.command == "health-check":
+        if args.stale_days <= 0:
+            print("configuration error: --stale-days must be positive", file=sys.stderr)
+            return 3
+        project_records = [
+            record for record in load_active_episode_records(artifacts)
+            if (record.get("project") or {}).get("project_id") == args.project_id
+        ]
+        configured_project = app_config.projects.get(args.project_id)
+        if configured_project:
+            claude_home = Path(os.getenv("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+        known_revisions = {(record["source_id"], record["source_hash"]) for record in project_records}
+        known_revisions.update(
+            (status["source_id"], status["attempted_hash"])
+            for status in job_failures_for_project(artifacts, args.project_id)
+        )
+        unprocessed_source_ids = sorted(
+            source.source_id
+            for source in (
+                claude_sessions({args.project_id: configured_project}, claude_home, args.project_id)
+                if configured_project else []
+            )
+            if (source.source_id, source_hash(source.path)) not in known_revisions
+        )
+        findings = deterministic_findings(
+            artifacts,
+            args.project_id,
+            project_records,
+            stale_before=datetime.now(timezone.utc) - timedelta(days=args.stale_days),
+            unprocessed_source_ids=unprocessed_source_ids,
+        )
+        ai_status = "not_requested"
+        if args.ai or health_checker is not None:
+            sensitive_paths = (str(configured_project.root),) if configured_project else ()
+            checker = health_checker or CursorHealthChecker(
+                mode=resolved.cursor_mode, model=resolved.cursor_model, sensitive_paths=sensitive_paths
+            )
+            try:
+                proposed = checker.analyze(args.project_id, project_records)
+                findings.extend(grounded_findings(proposed, {record["id"] for record in project_records}))
+                ai_status = "completed"
+            except Exception as error:
+                ai_status = "failed"
+                print(f"AI health check failed: {error}", file=sys.stderr)
+        report_path = write_report(artifacts, args.project_id, findings, ai_status=ai_status)
+        rendered_findings = [finding.model_dump() for finding in findings]
+        print(json.dumps({
+            "report_path": str(report_path),
+            "project_id": args.project_id,
+            "ai_status": ai_status,
+            "findings": rendered_findings,
+        }, indent=2))
+        return 1 if ai_status == "failed" else 0
     elif args.command in {"verify", "reject", "supersede", "history"}:
         record = find_record(artifacts, args.record_id)
         if record is None:

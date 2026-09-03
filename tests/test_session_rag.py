@@ -17,6 +17,7 @@ from session_rag.extractors.base import (
 )
 from session_rag.hook import HookConfig, _INTRO, _estimate_tokens, _format_record, handle_user_prompt
 from session_rag.retrieval import RetrievalScope, search
+from session_rag.overlay import read_state
 
 from conftest import make_record
 
@@ -53,6 +54,16 @@ class KeywordEmbedder:
             [float("rabbitmq" in text.lower()), float("postgres" in text.lower())]
             for text in texts
         ]
+
+
+class FakeHealthChecker:
+    def __init__(self, findings):
+        self.findings = findings
+        self.calls = 0
+
+    def analyze(self, project_id, records):
+        self.calls += 1
+        return self.findings
 
 
 def _extract_and_activate(artifacts_dir, transcript, content, question, summary):
@@ -1663,3 +1674,148 @@ def test_ingest_does_not_compare_records_without_trusted_project_provenance(tmp_
     run(["ingest", "--artifacts", str(artifacts), "--database", str(database)], KeywordEmbedder())
 
     assert "Indexed 2 episode records" in capsys.readouterr().out
+
+
+def test_health_check_writes_deterministic_review_report_without_changing_record_state(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    transcript = tmp_path / "old.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"old behavior"}}\n')
+    record = make_record(
+        question="How did the old deploy work?",
+        summary="It copied jars directly.",
+        timestamp="2020-01-01T00:00:00Z",
+        temporal_scope="time_sensitive",
+        evidence_location=None,
+        source=str(transcript),
+        source_session_id="old",
+        project=ProjectProvenance(project_id="lvcore"),
+    )
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([record]))
+    record_id = load_active_episode_records(artifacts)[0]["id"]
+    capsys.readouterr()
+
+    assert run(["health-check", "--project-id", "lvcore", "--artifacts", str(artifacts)]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    categories = {finding["category"] for finding in result["findings"]}
+    assert {"stale_record", "unsupported_claim"} <= categories
+    assert Path(result["report_path"]).exists()
+    assert read_state(artifacts, record_id)["verification_status"] == "unreviewed"
+
+
+def test_health_check_accepts_grounded_cursor_findings_and_rejects_forged_record_links(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"deployment"}}\n')
+    record = make_record(
+        question="How is deployment performed?",
+        summary="The build uploads dependencies.",
+        source=str(transcript),
+        source_session_id="session",
+        project=ProjectProvenance(project_id="lvcore"),
+    )
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([record]))
+    record_id = load_active_episode_records(artifacts)[0]["id"]
+    checker = FakeHealthChecker([
+        {
+            "category": "contradiction",
+            "title": "Deployment descriptions disagree",
+            "explanation": "Review current deployment behavior.",
+            "record_ids": [record_id],
+            "recommended_action": "Verify against the repository.",
+        },
+        {
+            "category": "suggested_article",
+            "title": "Forged source",
+            "explanation": "Bad link.",
+            "record_ids": ["invented-record"],
+            "recommended_action": "Do not keep this link.",
+        },
+    ])
+    capsys.readouterr()
+
+    assert run(["health-check", "--project-id", "lvcore", "--ai", "--artifacts", str(artifacts)], health_checker=checker) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert checker.calls == 1
+    contradictions = [finding for finding in result["findings"] if finding["category"] == "contradiction"]
+    assert len(contradictions) == 1
+    assert contradictions[0]["record_ids"] == [record_id]
+    assert all("invented-record" not in finding["record_ids"] for finding in result["findings"])
+
+
+def test_health_check_reports_unprocessed_sessions_and_project_scoped_empty_retrievals(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    project = tmp_path / "lvcore"
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "never-imported.jsonl").write_text('{"type":"user","message":{"content":"new"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{database}"\n'
+        f'[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    run(["--config", str(config), "search", "nothing", "--project-id", "lvcore"], KeywordEmbedder())
+    capsys.readouterr()
+
+    run(["--config", str(config), "health-check", "--project-id", "lvcore"])
+
+    categories = {finding["category"] for finding in json.loads(capsys.readouterr().out)["findings"]}
+    assert {"unprocessed_source", "weak_retrieval"} <= categories
+
+
+def test_health_check_report_path_cannot_escape_through_project_id(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+
+    run(["health-check", "--project-id", "../../outside", "--artifacts", str(artifacts)])
+
+    report = Path(json.loads(capsys.readouterr().out)["report_path"])
+    assert report.is_relative_to(artifacts / "health-checks")
+    assert ".." not in report.relative_to(artifacts / "health-checks").parts
+
+
+def test_health_check_locally_flags_same_question_with_conflicting_answers(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    for name, answer in (("old", "Deploy with Ant."), ("new", "Deploy with Gradle.")):
+        transcript = tmp_path / f"{name}.jsonl"
+        transcript.write_text('{"type":"user","message":{"content":"deploy"}}\n')
+        run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+            make_record(
+                question="How do we deploy LVCore?", summary=answer, source=str(transcript),
+                source_session_id=name, project=ProjectProvenance(project_id="lvcore"),
+            )
+        ]))
+    capsys.readouterr()
+
+    run(["health-check", "--project-id", "lvcore", "--artifacts", str(artifacts)])
+
+    findings = json.loads(capsys.readouterr().out)["findings"]
+    assert any(finding["category"] == "possible_contradiction" for finding in findings)
+
+
+def test_health_check_treats_a_changed_session_revision_as_unprocessed(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    project = tmp_path / "lvcore"
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "session.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"old"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\n'
+        f'[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    record = make_record(source=str(transcript), source_session_id="session", project=ProjectProvenance(project_id="lvcore"))
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([record]))
+    transcript.write_text('{"type":"user","message":{"content":"new revision"}}\n')
+    capsys.readouterr()
+
+    run(["--config", str(config), "health-check", "--project-id", "lvcore"])
+
+    findings = json.loads(capsys.readouterr().out)["findings"]
+    assert any(finding["category"] == "unprocessed_source" for finding in findings)

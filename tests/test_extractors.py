@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from session_rag.extractors.cursor import CursorExtractor
+from session_rag.health import CursorHealthChecker
 from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry, ProjectProvenance
 
 
@@ -215,6 +216,28 @@ def test_cursor_extractor_rejects_forged_trusted_provenance(tmp_path):
 
     with pytest.raises(ExtractionError):
         CursorExtractor(runner=runner).extract(transcript)
+
+
+def test_cursor_health_checker_redacts_secrets_and_project_paths_before_send(tmp_path):
+    observed = {}
+
+    def runner(command, **kwargs):
+        observed["input"] = kwargs["input"]
+        result = json.dumps({"findings": []})
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"type": "result", "subtype": "success", "result": result}), stderr="")
+
+    checker = CursorHealthChecker(
+        mode="ask", model="test-model", runner=runner, sensitive_paths=("/Users/person/private-project",)
+    )
+    checker.analyze("project", [{
+        "id": "record-1", "question": "Where?", "summary": "At /Users/person/private-project",
+        "resolution": "token='abcdefghijk'", "systems": [],
+        "code_references": ["/Users/person/private-project/secret.py"], "source_references": [],
+    }])
+
+    assert "/Users/person/private-project" not in observed["input"]
+    assert "abcdefghijk" not in observed["input"]
+    assert "[REDACTED]" in observed["input"]
 
 
 def test_cursor_extractor_reads_mode_and_model_from_environment(tmp_path, monkeypatch):

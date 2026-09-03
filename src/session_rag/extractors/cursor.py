@@ -22,6 +22,7 @@ from .base import (
 )
 from ..sanitize import DEFAULT_MAX_SANITIZED_CHARS, SanitizationBudgetExceeded, SanitizedSession, sanitize_session
 from ..envconfig import env_value
+from ..cursor_client import run_cursor_json
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -75,17 +76,6 @@ def _resolved_evidence_location(location_id: str | None, sanitized: SanitizedSes
     if text is None:
         return None
     return EvidenceLocation(identifier=location_id, preserved_text=text)
-
-
-def _json_from_model_text(text: str) -> dict:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        cleaned = "\n".join(lines[1:-1]).strip()
-    value = json.loads(cleaned)
-    if not isinstance(value, dict):
-        raise ValueError("Extractor response must be a JSON object")
-    return value
 
 
 class CursorExtractor:
@@ -167,22 +157,7 @@ class CursorExtractor:
         except SanitizationBudgetExceeded as error:
             raise ExtractionBlocked(str(error)) from error
         prompt = self._prompt(sanitized.prompt_text)
-        command = [
-            self._executable,
-            "--print",
-            "--output-format",
-            "json",
-            "--mode",
-            self._mode,
-            "--model",
-            self._model,
-            "--sandbox",
-            "enabled",
-            "--workspace",
-            str(self._workspace),
-            "--trust",
-        ]
-        drafts = self._run_with_retries(command, prompt)
+        drafts = self._run_with_retries(prompt)
         try:
             return [
                 StructuredRecord(
@@ -208,7 +183,7 @@ class CursorExtractor:
             # and never leaks an uncaught traceback.
             raise ExtractionError(f"Extracted record failed trusted provenance validation: {error}") from error
 
-    def _run_with_retries(self, command: list[str], prompt: str) -> list[ExtractedKnowledge]:
+    def _run_with_retries(self, prompt: str) -> list[ExtractedKnowledge]:
         """Call Cursor and parse its response, retrying only invalid output a
         bounded number of times. Only genuine subprocess-level infra failures
         (timeout, nonzero exit, Cursor binary unavailable) raise
@@ -221,27 +196,13 @@ class CursorExtractor:
         last_error: Exception | None = None
         for _ in range(self._max_output_retries + 1):
             try:
-                completed = self._runner(
-                    command,
-                    input=prompt,
-                    text=True,
-                    capture_output=True,
-                    check=True,
-                    timeout=120,
+                value = run_cursor_json(
+                    prompt, executable=self._executable, runner=self._runner, workspace=self._workspace,
+                    mode=self._mode, model=self._model, timeout=120,
                 )
+                return ExtractionResult.model_validate(value).records
             except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
                 raise ExtractionPendingRetry(f"Cursor unavailable: {type(error).__name__}: {error}") from error
-
-            try:
-                envelope = json.loads(completed.stdout)
-                if not isinstance(envelope, dict):
-                    raise ValueError("Cursor envelope must be an object")
-                if envelope.get("type") != "result" or envelope.get("subtype") != "success":
-                    raise ValueError(f"Cursor did not return a successful result: {envelope.get('subtype')!r}")
-                result_text = envelope.get("result")
-                if not isinstance(result_text, str):
-                    raise ValueError("Cursor result must be text")
-                return ExtractionResult.model_validate(_json_from_model_text(result_text)).records
             except Exception as error:
                 last_error = error
         raise ExtractionError(

@@ -82,6 +82,10 @@ _Avoid_: Exact Duplicate, automatic merge
 The project-filterable list produced by `memory duplicates`. It contains Possible Duplicates requiring human judgment, not Exact Duplicates already handled deterministically.
 _Avoid_: Exact duplicate list, deletion queue
 
+**Health Check**:
+A read-only, project-scoped audit that produces a durable review report without changing Episode Records or Verification Status. Local checks identify duplicate candidates, stale records, missing evidence, failed sources, and weak retrieval. Explicit `--ai` consent additionally sends sanitized structured Episode Records (never raw transcripts or project-root paths) to the configured Cursor model to propose contradictions, coverage gaps, and curated articles; application code rejects invented record links.
+_Avoid_: Automatic repair, automatic verification, model-authored provenance
+
 **Evidence Location**:
 A stable, source-adapter-issued pointer into the exact source revision an Episode Record's claim is drawn from, beyond source type/ID/hash alone: an `identifier` meaningful within that source revision plus `preserved_text`, a sanitized snapshot of the cited evidence captured at import time. For a Claude session, the identifier is the source's per-turn ID when present or a deterministic raw-file position; for a Markdown Knowledge Base, it is the heading path plus occurrence/part when needed. An LLM may only select an identifier the source adapter supplied for that revision — application code rejects invented identifiers — and never supplies `preserved_text` itself. Deterministic adapters assign both fields directly. The location is persisted inside the Episode Record's immutable Extraction Artifact, so a citation stays resolvable after the live source changes or is deleted; resolution never depends on re-reading the live source.
 _Avoid_: Sanitized line number (the transient rendering it replaces — not stable, not preserved, not what the citation should ever display)

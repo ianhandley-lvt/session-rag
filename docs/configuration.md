@@ -80,6 +80,11 @@ the review queue with `memory duplicates --project-id PROJECT_ID`. Tune the
 provisional cosine floor with `MEMORY_SEMANTIC_DUPLICATE_THRESHOLD` (default
 `0.92`) only against evaluated examples.
 
+Run `memory health-check --project-id PROJECT_ID` for a local, read-only audit.
+Add `--ai` only when you explicitly want structured Episode Records sent to the
+configured Cursor model for contradiction, coverage-gap, and article
+suggestions. Both modes write a durable report and apply no changes.
+
 `capture` refuses to run unless the selected project ID and root match a
 project registered in the TOML file. This prevents an environment variable
 from silently attaching one project's provenance to another project's

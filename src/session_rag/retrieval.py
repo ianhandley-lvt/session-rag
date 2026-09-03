@@ -206,7 +206,12 @@ def search(
 
     config = config or RetrievalConfig.from_env()
     scope = scope or RetrievalScope.from_env()
-    trace: dict = {"query": query, "candidates": []}
+    trace: dict = {
+        "query": query,
+        "project_id": scope.project_id,
+        "global_scope": scope.global_scope,
+        "candidates": [],
+    }
     if not query.strip():
         return [], trace
 
@@ -270,6 +275,22 @@ def search(
     append_json_line(artifacts_root / TRACE_LOG_NAME, persisted_trace)
 
     return results, trace
+
+
+def weak_retrieval_count(artifacts_root: Path, project_id: str) -> int:
+    """Count project-scoped retrievals that returned no evidence."""
+
+    path = artifacts_root / TRACE_LOG_NAME
+    if not path.exists():
+        return 0
+    count = 0
+    for line in path.read_text().splitlines():
+        if not line:
+            continue
+        trace = json.loads(line)
+        if trace.get("project_id") == project_id and not trace.get("global_scope") and not trace.get("returned_ids"):
+            count += 1
+    return count
 
 
 def purge_traces(artifacts_root: Path, record_ids: set[str]) -> None:
