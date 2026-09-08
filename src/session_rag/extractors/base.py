@@ -9,10 +9,16 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=20_000)]
 ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
+# Evidence snapshots are source-adapter output, not model-authored record
+# prose. Their resource bound is the sanitizer/importer's configured source
+# budget, enforced before extraction; reusing NonEmptyText here creates a
+# contradictory second 20,000-character ceiling after an operator explicitly
+# admitted a larger source revision.
+EvidenceText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 TemporalScope = Literal["durable", "time_sensitive"]
-SourceType = Literal["claude_session"]
+SourceType = Literal["claude_session", "cursor_session", "markdown_knowledge_base"]
 
 
 class Attribution(BaseModel):
@@ -46,7 +52,7 @@ class EvidenceLocation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     identifier: ShortText
-    preserved_text: NonEmptyText
+    preserved_text: EvidenceText
 
 
 class ExtractedKnowledge(BaseModel):
@@ -99,6 +105,8 @@ class StructuredRecord(ExtractedKnowledge):
     operator_id: ShortText
     project: ProjectProvenance | None = None
     prompt_version: int
+    document_status: ShortText | None = None
+    source_references: list[ShortText] = Field(default_factory=list, max_length=100)
     # Overrides ExtractedKnowledge.evidence_location (a bare model-proposed
     # str) with the application-resolved EvidenceLocation object — same
     # field name as the draft, reprocessed by application code before a

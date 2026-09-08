@@ -1,6 +1,6 @@
-# Session RAG
+# Memory
 
-Session RAG turns knowledge created in work sessions and other source systems into durable evidence that can be retrieved for later work.
+Memory turns knowledge created in work sessions and other source systems into durable evidence that can be retrieved for later work.
 
 ## Language
 
@@ -13,8 +13,12 @@ The validated, schema-checked, provenance-attached persisted representation of o
 _Avoid_: Episode (when the persisted/validated artifact specifically is meant, not the underlying real-world unit), record (ambiguous alone)
 
 **Source Type**:
-Immutable provenance category of an Episode Record's origin — `claude_session`, `adr`, `notion_page`, `external_doc`, etc. Set once at extraction time from the source adapter, never changes for a given record.
+Immutable provenance category of an Episode Record's origin — `claude_session`, `markdown_knowledge_base`, `adr`, `notion_page`, `external_doc`, etc. Set once at extraction time from the source adapter, never changes for a given record.
 _Avoid_: Authority (source type says where evidence came from, not how much to trust it)
+
+**Markdown Knowledge Base**:
+A curated collection of Markdown articles that already contains synthesized knowledge and source citations. It enters Memory through deterministic heading/paragraph parsing rather than an LLM extractor: each article is one source revision, and its meaningful sections become Episode Records. Navigation files are not evidence, and the knowledge base's RAW folder remains provenance rather than a second copy in the retrieval index.
+_Avoid_: Transcript (the content is already authored knowledge), raw-document chunking (section boundaries carry meaning), re-extraction
 
 **Verification Status**:
 Mutable lifecycle state of one Episode Record — `unreviewed`, `verified`, `rejected`, `superseded`. Changes after extraction, independent of source type.
@@ -66,6 +70,22 @@ _Avoid_: Latest revision (implies mere recency, not the atomic all-or-nothing sw
 The versioned, immutable JSON envelope holding all Episode Records produced from one source revision — keyed by source ID and source hash so re-extraction never destroys a prior revision. The durable, replayable input to the LanceDB index; LanceDB itself stays a rebuildable derived index, never the system of record. See [ADR-0001](docs/adr/0001-extraction-artifacts-are-the-system-of-record.md).
 _Avoid_: Extraction result, cache (implies disposable; this is durable), vector row, index row
 
+**Exact Duplicate**:
+An Episode Record whose normalized knowledge fields have the same fingerprint as an older record in the same trusted project. It remains in its immutable artifact with a `duplicate_of` provenance link, but is omitted from retrieval automatically.
+_Avoid_: Deleting the artifact, semantic duplicate (exactness is deterministic)
+
+**Possible Duplicate**:
+An Episode Record whose embedding is highly similar to an older, non-identical record in the same trusted project. It remains retrievable and receives a scored `reinforces` link plus a review flag; semantic similarity never deletes or merges it automatically.
+_Avoid_: Exact Duplicate, automatic merge
+
+**Duplicate Review Queue**:
+The project-filterable list produced by `memory duplicates`. It contains Possible Duplicates requiring human judgment, not Exact Duplicates already handled deterministically.
+_Avoid_: Exact duplicate list, deletion queue
+
+**Health Check**:
+A read-only, project-scoped audit that produces a durable review report without changing Episode Records or Verification Status. Local checks identify duplicate candidates, stale records, missing evidence, failed sources, and weak retrieval. Explicit `--ai` consent additionally sends sanitized structured Episode Records (never raw transcripts or project-root paths) to the configured Cursor model to propose contradictions, coverage gaps, and curated articles; application code rejects invented record links.
+_Avoid_: Automatic repair, automatic verification, model-authored provenance
+
 **Evidence Location**:
-A stable pointer into the exact source revision an Episode Record's claim is drawn from, beyond source type/ID/hash alone: an `identifier` (the source's own stable per-turn id when it provides one, otherwise a deterministic position in the immutable raw file — never a position in the transient, per-extraction sanitized rendering, which shifts whenever a turn is skipped or renders as more than one line) plus `preserved_text`, a snapshot of that turn's sanitized text captured at extraction time. The model may only select an identifier the source adapter's sanitizer itself produced for that exact revision — application code rejects anything else, including a plausible-looking invented one — and never supplies `preserved_text` itself. Persisted inside the Episode Record's own Extraction Artifact, so a citation stays resolvable even after the live source at `source` has since changed or been deleted; resolution never re-reads the live source.
+A stable, source-adapter-issued pointer into the exact source revision an Episode Record's claim is drawn from, beyond source type/ID/hash alone: an `identifier` meaningful within that source revision plus `preserved_text`, a sanitized snapshot of the cited evidence captured at import time. For a Claude session, the identifier is the source's per-turn ID when present or a deterministic raw-file position; for a Markdown Knowledge Base, it is the heading path plus occurrence/part when needed. An LLM may only select an identifier the source adapter supplied for that revision — application code rejects invented identifiers — and never supplies `preserved_text` itself. Deterministic adapters assign both fields directly. The location is persisted inside the Episode Record's immutable Extraction Artifact, so a citation stays resolvable after the live source changes or is deleted; resolution never depends on re-reading the live source.
 _Avoid_: Sanitized line number (the transient rendering it replaces — not stable, not preserved, not what the citation should ever display)

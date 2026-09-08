@@ -16,7 +16,7 @@ class Embedder(Protocol):
     def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
-def _retrieval_text(record: dict) -> str:
+def retrieval_text(record: dict) -> str:
     """Assembled from question/summary/resolution/systems/code_references —
     the fields a search over durable knowledge should match against, not the
     raw conversational transcript."""
@@ -40,7 +40,7 @@ def index_episode_records(database: Path, records: list[dict], embedder: Embedde
     if not records:
         return 0
     database.mkdir(parents=True, exist_ok=True)
-    texts = [_retrieval_text(record) for record in records]
+    texts = [retrieval_text(record) for record in records]
     vectors = embedder.embed(texts)
     rows = [
         {
@@ -63,6 +63,8 @@ def index_episode_records(database: Path, records: list[dict], embedder: Embedde
             # Empty string for "no location", consistent with this file's
             # other optional-field conventions (project_id, temporal_scope).
             "evidence_location_id": (record.get("evidence_location") or {}).get("identifier") or "",
+            "document_status": record.get("document_status") or "",
+            "source_references": record.get("source_references") or [],
             "embedding_model": embedder.model_name,
             "vector": vector,
         }

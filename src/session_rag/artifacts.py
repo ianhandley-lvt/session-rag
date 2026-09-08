@@ -4,12 +4,13 @@ import hashlib
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from .extractors.base import SourceType, StructuredRecord
 from .jsonio import atomic_write_json, read_json
 
 SCHEMA_VERSION = 1
+SOURCE_TYPE_DIRS = frozenset(get_args(SourceType))
 
 JobStatus = Literal["pending_retry", "failed", "blocked"]
 
@@ -153,9 +154,23 @@ def _iter_source_dirs(root: Path) -> Iterator[tuple[str, Path]]:
 
     if not root.exists():
         return
-    for source_type_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+    for source_type_dir in sorted(p for p in root.iterdir() if p.is_dir() and p.name in SOURCE_TYPE_DIRS):
         for source_dir in sorted(p for p in source_type_dir.iterdir() if p.is_dir()):
             yield source_type_dir.name, source_dir
+
+
+def job_failures_for_project(root: Path, project_id: str) -> list[dict]:
+    """Extraction Job Status entries owned by one trusted project."""
+
+    failures = []
+    for source_type, source_dir in _iter_source_dirs(root):
+        path = job_status_path(root, source_type=source_type, source_id=source_dir.name)
+        if not path.exists():
+            continue
+        status = read_json(path)
+        if status.get("project_id") == project_id:
+            failures.append({**status, "source_type": source_type, "source_id": source_dir.name})
+    return failures
 
 
 def _denormalize(record: dict, envelope: dict) -> dict:
@@ -168,6 +183,7 @@ def _denormalize(record: dict, envelope: dict) -> dict:
         "source_type": envelope["source_type"],
         "source_id": envelope["source_id"],
         "source_hash": envelope["source_hash"],
+        "extracted_at": envelope.get("extracted_at", ""),
     }
 
 

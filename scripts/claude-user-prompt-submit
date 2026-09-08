@@ -1,0 +1,15 @@
+#!/bin/sh
+
+set -u
+
+memory_command=$(command -v memory 2>/dev/null || true)
+if [ -z "$memory_command" ] && [ -x "$HOME/.local/bin/memory" ]; then
+  memory_command="$HOME/.local/bin/memory"
+fi
+
+if [ -z "$memory_command" ] || ! "$memory_command" hook "$@"
+then
+  printf '{}\n'
+fi
+
+exit 0

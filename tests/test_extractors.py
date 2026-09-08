@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from session_rag.extractors.cursor import CursorExtractor
+from session_rag.health import CursorHealthChecker
 from session_rag.extractors.base import ExtractionBlocked, ExtractionError, ExtractionPendingRetry, ProjectProvenance
 
 
@@ -217,6 +218,28 @@ def test_cursor_extractor_rejects_forged_trusted_provenance(tmp_path):
         CursorExtractor(runner=runner).extract(transcript)
 
 
+def test_cursor_health_checker_redacts_secrets_and_project_paths_before_send(tmp_path):
+    observed = {}
+
+    def runner(command, **kwargs):
+        observed["input"] = kwargs["input"]
+        result = json.dumps({"findings": []})
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"type": "result", "subtype": "success", "result": result}), stderr="")
+
+    checker = CursorHealthChecker(
+        mode="ask", model="test-model", runner=runner, sensitive_paths=("/Users/person/private-project",)
+    )
+    checker.analyze("project", [{
+        "id": "record-1", "question": "Where?", "summary": "At /Users/person/private-project",
+        "resolution": "token='abcdefghijk'", "systems": [],
+        "code_references": ["/Users/person/private-project/secret.py"], "source_references": [],
+    }])
+
+    assert "/Users/person/private-project" not in observed["input"]
+    assert "abcdefghijk" not in observed["input"]
+    assert "[REDACTED]" in observed["input"]
+
+
 def test_cursor_extractor_reads_mode_and_model_from_environment(tmp_path, monkeypatch):
     transcript = tmp_path / "session.jsonl"
     write_transcript(transcript)
@@ -296,6 +319,77 @@ def test_cursor_extractor_preserves_subagent_messages(tmp_path):
     CursorExtractor(runner=runner).extract(transcript)
 
     assert "Subagent: Subagent found the cause." in observed["input"]
+
+
+def test_cursor_extractor_preserves_evidence_entry_larger_than_record_text_limit(tmp_path):
+    """Evidence snapshots are source text, not model-authored record fields.
+
+    A session whose explicitly configured sanitization budget exceeds the
+    20,000-character record-text limit must not crash after Cursor has already
+    returned a valid record that cites a real, larger source entry.
+    """
+
+    transcript = tmp_path / "large-evidence-session.jsonl"
+    evidence = "<task-notification>\n" + ("durable investigation evidence " * 800) + "\n</task-notification>"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "large-task-notification",
+                "message": {"content": evidence},
+            }
+        )
+        + "\n"
+    )
+
+    def runner(*args, **kwargs):
+        return cursor_response(
+            {
+                "records": [
+                    {
+                        "question": "What did the investigation establish?",
+                        "summary": "The notification contains durable investigation evidence.",
+                        "evidence_location": "large-task-notification",
+                    }
+                ]
+            }
+        )
+
+    records = CursorExtractor(runner=runner, max_sanitized_chars=50_000).extract(transcript)
+
+    assert records[0].evidence_location.identifier == "large-task-notification"
+    assert records[0].evidence_location.preserved_text == f"User: {evidence}"
+
+
+def test_cursor_extractor_converts_provenance_attachment_validation_to_extraction_error(tmp_path):
+    transcript = tmp_path / "invalid-evidence-identifier.jsonl"
+    oversized_identifier = "x" * 501
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": oversized_identifier,
+                "message": {"content": "Evidence"},
+            }
+        )
+        + "\n"
+    )
+
+    def runner(*args, **kwargs):
+        return cursor_response(
+            {
+                "records": [
+                    {
+                        "question": "What is the evidence?",
+                        "summary": "Evidence",
+                        "evidence_location": oversized_identifier,
+                    }
+                ]
+            }
+        )
+
+    with pytest.raises(ExtractionError, match="trusted provenance validation"):
+        CursorExtractor(runner=runner).extract(transcript)
 
 
 def test_cursor_extractor_honors_configured_sensitive_paths(tmp_path):

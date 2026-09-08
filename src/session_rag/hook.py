@@ -50,12 +50,16 @@ def _location_suffix(result: dict) -> str:
 
 
 def _format_record(index: int, result: dict) -> str:
-    return (
+    formatted = (
         f"[{index}] {result['text']}\n"
         f"Source: {result['source']} "
         f"(artifact {result['source_type']}/{result['source_id']}/{result['source_hash']}"
         f"{_location_suffix(result)}, {result['timestamp']})"
     )
+    references = result.get("source_references") or []
+    if references:
+        formatted += f"\nUnderlying sources: {', '.join(references)}"
+    return formatted
 
 
 def format_context(results: list[dict]) -> str:

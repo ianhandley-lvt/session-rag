@@ -7,6 +7,8 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from .base import (
     Attribution,
     EvidenceLocation,
@@ -19,6 +21,8 @@ from .base import (
     StructuredRecord,
 )
 from ..sanitize import DEFAULT_MAX_SANITIZED_CHARS, SanitizationBudgetExceeded, SanitizedSession, sanitize_session
+from ..envconfig import env_value
+from ..cursor_client import run_cursor_json
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -29,7 +33,8 @@ DEFAULT_MAX_OUTPUT_RETRIES = 1
 
 
 def _configured(value: str | None, env_var: str, default: str) -> str:
-    return value if value is not None else os.getenv(env_var, default)
+    suffix = env_var.removeprefix("SESSION_RAG_")
+    return value if value is not None else env_value(suffix, default)
 
 
 def _project_from_environment() -> ProjectProvenance | None:
@@ -37,14 +42,14 @@ def _project_from_environment() -> ProjectProvenance | None:
     never inferred (e.g. from Git). Absent entirely when no project_id is set —
     matches ProjectProvenance being optional outside a Git repo."""
 
-    project_id = os.getenv("SESSION_RAG_PROJECT_ID", "")
+    project_id = env_value("PROJECT_ID", "")
     if not project_id:
         return None
-    dirty_raw = os.getenv("SESSION_RAG_WORKING_TREE_DIRTY", "")
+    dirty_raw = env_value("WORKING_TREE_DIRTY", "")
     return ProjectProvenance(
         project_id=project_id,
-        project_root=os.getenv("SESSION_RAG_PROJECT_ROOT") or None,
-        repository_revision=os.getenv("SESSION_RAG_REPOSITORY_REVISION") or None,
+        project_root=env_value("PROJECT_ROOT") or None,
+        repository_revision=env_value("REPOSITORY_REVISION") or None,
         working_tree_dirty=(dirty_raw.lower() == "true") if dirty_raw else None,
     )
 
@@ -73,17 +78,6 @@ def _resolved_evidence_location(location_id: str | None, sanitized: SanitizedSes
     return EvidenceLocation(identifier=location_id, preserved_text=text)
 
 
-def _json_from_model_text(text: str) -> dict:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        cleaned = "\n".join(lines[1:-1]).strip()
-    value = json.loads(cleaned)
-    if not isinstance(value, dict):
-        raise ValueError("Extractor response must be a JSON object")
-    return value
-
-
 class CursorExtractor:
     name = "cursor"
 
@@ -100,6 +94,9 @@ class CursorExtractor:
         project: ProjectProvenance | None = None,
         prompt_version: int | None = None,
         max_output_retries: int | None = None,
+        source_type: str = "claude_session",
+        source_id: str | None = None,
+        source_uri: str | None = None,
     ) -> None:
         self._executable = executable
         self._runner = runner
@@ -120,7 +117,7 @@ class CursorExtractor:
         if not self._operator_id:
             raise ValueError(
                 "operator_id must be configured explicitly (constructor arg or "
-                "SESSION_RAG_OPERATOR_ID) — it is never inferred from Git identity"
+                "MEMORY_OPERATOR_ID) — it is never inferred from Git identity"
             )
         self._project = project if project is not None else _project_from_environment()
         self._prompt_version = prompt_version or int(
@@ -129,6 +126,9 @@ class CursorExtractor:
         self._max_output_retries = max_output_retries or int(
             _configured(None, "SESSION_RAG_MAX_OUTPUT_RETRIES", str(DEFAULT_MAX_OUTPUT_RETRIES))
         )
+        self._source_type = source_type
+        self._source_id = source_id
+        self._source_uri = source_uri
 
     @property
     def model(self) -> str:
@@ -157,40 +157,33 @@ class CursorExtractor:
         except SanitizationBudgetExceeded as error:
             raise ExtractionBlocked(str(error)) from error
         prompt = self._prompt(sanitized.prompt_text)
-        command = [
-            self._executable,
-            "--print",
-            "--output-format",
-            "json",
-            "--mode",
-            self._mode,
-            "--model",
-            self._model,
-            "--sandbox",
-            "enabled",
-            "--workspace",
-            str(self._workspace),
-            "--trust",
-        ]
-        drafts = self._run_with_retries(command, prompt)
-        return [
-            StructuredRecord(
-                **{
-                    **draft.model_dump(),
-                    "attribution": _person_attribution(draft.attribution),
-                    "evidence_location": _resolved_evidence_location(draft.evidence_location, sanitized),
-                },
-                source=str(transcript.resolve()),
-                source_session_id=transcript.stem,
-                source_type="claude_session",
-                operator_id=self._operator_id,
-                project=self._project,
-                prompt_version=self._prompt_version,
-            )
-            for draft in drafts
-        ]
+        drafts = self._run_with_retries(prompt)
+        try:
+            return [
+                StructuredRecord(
+                    **{
+                        **draft.model_dump(),
+                        "attribution": _person_attribution(draft.attribution),
+                        "evidence_location": _resolved_evidence_location(draft.evidence_location, sanitized),
+                    },
+                    source=self._source_uri or str(transcript.resolve()),
+                    source_session_id=self._source_id or transcript.stem,
+                    source_type=self._source_type,
+                    operator_id=self._operator_id,
+                    project=self._project,
+                    prompt_version=self._prompt_version,
+                )
+                for draft in drafts
+            ]
+        except ValidationError as error:
+            # Cursor has already returned at this point, so this is not a
+            # provider retry. Convert application-side provenance/schema
+            # attachment failures into the extractor's domain error so the
+            # pipeline records `failed`, preserves the prior Active Revision,
+            # and never leaks an uncaught traceback.
+            raise ExtractionError(f"Extracted record failed trusted provenance validation: {error}") from error
 
-    def _run_with_retries(self, command: list[str], prompt: str) -> list[ExtractedKnowledge]:
+    def _run_with_retries(self, prompt: str) -> list[ExtractedKnowledge]:
         """Call Cursor and parse its response, retrying only invalid output a
         bounded number of times. Only genuine subprocess-level infra failures
         (timeout, nonzero exit, Cursor binary unavailable) raise
@@ -203,27 +196,13 @@ class CursorExtractor:
         last_error: Exception | None = None
         for _ in range(self._max_output_retries + 1):
             try:
-                completed = self._runner(
-                    command,
-                    input=prompt,
-                    text=True,
-                    capture_output=True,
-                    check=True,
-                    timeout=120,
+                value = run_cursor_json(
+                    prompt, executable=self._executable, runner=self._runner, workspace=self._workspace,
+                    mode=self._mode, model=self._model, timeout=120,
                 )
+                return ExtractionResult.model_validate(value).records
             except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
                 raise ExtractionPendingRetry(f"Cursor unavailable: {type(error).__name__}: {error}") from error
-
-            try:
-                envelope = json.loads(completed.stdout)
-                if not isinstance(envelope, dict):
-                    raise ValueError("Cursor envelope must be an object")
-                if envelope.get("type") != "result" or envelope.get("subtype") != "success":
-                    raise ValueError(f"Cursor did not return a successful result: {envelope.get('subtype')!r}")
-                result_text = envelope.get("result")
-                if not isinstance(result_text, str):
-                    raise ValueError("Cursor result must be text")
-                return ExtractionResult.model_validate(_json_from_model_text(result_text)).records
             except Exception as error:
                 last_error = error
         raise ExtractionError(

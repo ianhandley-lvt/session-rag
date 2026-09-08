@@ -1,10 +1,13 @@
 import json
+import re
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
 
-from session_rag.artifacts import artifact_path, find_record, job_status_path, read_active_hash
+from session_rag.artifacts import artifact_path, find_record, job_status_path, load_active_episode_records, read_active_hash
+from session_rag.app_config import load_app_config
 from session_rag.cli import run
 from session_rag.extractors.base import (
     EvidenceLocation,
@@ -15,6 +18,7 @@ from session_rag.extractors.base import (
 )
 from session_rag.hook import HookConfig, _INTRO, _estimate_tokens, _format_record, handle_user_prompt
 from session_rag.retrieval import RetrievalScope, search
+from session_rag.overlay import read_state
 
 from conftest import make_record
 
@@ -32,9 +36,11 @@ class FakeExtractor:
         # it was configured for (see write_job_status).
         self.project_id = project_id
         self.calls = 0
+        self.last_transcript = None
 
     def extract(self, transcript):
         self.calls += 1
+        self.last_transcript = transcript
         if self._error:
             raise self._error
         return self._records
@@ -49,6 +55,16 @@ class KeywordEmbedder:
             [float("rabbitmq" in text.lower()), float("postgres" in text.lower())]
             for text in texts
         ]
+
+
+class FakeHealthChecker:
+    def __init__(self, findings):
+        self.findings = findings
+        self.calls = 0
+
+    def analyze(self, project_id, records):
+        self.calls += 1
+        return self.findings
 
 
 def _extract_and_activate(artifacts_dir, transcript, content, question, summary):
@@ -78,6 +94,217 @@ def test_cli_ingests_from_artifacts_and_returns_cited_search_results(tmp_path, c
     output = capsys.readouterr().out
     assert "heartbeat timeout caused the reconnect" in output
     assert "session-123" in output
+
+
+def test_cli_uses_storage_paths_from_toml_config(tmp_path, capsys):
+    transcript = tmp_path / "session-123.jsonl"
+    artifacts_dir = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{artifacts_dir}"\n'
+        f'database = "{database}"\n'
+        'operator_id = "ian"\n'
+    )
+    _extract_and_activate(
+        artifacts_dir,
+        transcript,
+        "why did rabbitmq reconnect",
+        question="Why did RabbitMQ reconnect?",
+        summary="The heartbeat timeout caused the reconnect.",
+    )
+    embedder = KeywordEmbedder()
+    capsys.readouterr()
+
+    assert run(["--config", str(config_path), "ingest"], embedder) == 0
+    assert run(["--config", str(config_path), "search", "rabbitmq timeout", "--global-scope"], embedder) == 0
+
+    output = capsys.readouterr().out
+    assert "heartbeat timeout caused the reconnect" in output
+
+
+def test_cli_config_show_reports_global_config_and_all_registered_projects(tmp_path, capsys, monkeypatch):
+    project_root = tmp_path / "lvcore"
+    project_root.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n'
+        'operator_id = "ian"\n'
+        '[extractor]\n'
+        'mode = "ask"\n'
+        'model = "test-model"\n'
+        'max_sanitized_chars = 500000\n'
+        '[projects.lvcore]\n'
+        f'root = "{project_root}"\n'
+    )
+    monkeypatch.chdir(project_root)
+
+    assert run(["--config", str(config_path), "config", "show"]) == 0
+
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["operator_id"] == "ian"
+    assert shown["extractor"]["max_sanitized_chars"] == 500000
+    assert shown["projects"] == {
+        "lvcore": {"root": str(project_root), "knowledge_base": None}
+    }
+    assert "project" not in shown
+
+
+def test_cli_config_current_reports_project_for_current_directory(tmp_path, capsys, monkeypatch):
+    project_root = tmp_path / "lvcore"
+    project_root.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f'[projects.lvcore]\nroot = "{project_root}"\n')
+    monkeypatch.chdir(project_root)
+
+    assert run(["--config", str(config_path), "config", "current"]) == 0
+
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["project"] == {"id": "lvcore", "root": str(project_root), "knowledge_base": None}
+
+
+def test_cli_config_add_project_defaults_to_current_git_root(tmp_path, capsys, monkeypatch):
+    xdg_home = tmp_path / "xdg"
+    project = tmp_path / "schedule-management-service"
+    nested = project / "src"
+    nested.mkdir(parents=True)
+    (project / ".git").mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+    monkeypatch.delenv("MEMORY_CONFIG", raising=False)
+    monkeypatch.delenv("SESSION_RAG_CONFIG", raising=False)
+    monkeypatch.chdir(nested)
+
+    assert run(["config", "add-project"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "added"
+    assert output["project_id"] == "schedule-management-service"
+    assert output["root"] == str(project.resolve())
+    config = load_app_config(xdg_home / "memory" / "config.toml")
+    assert config.projects["schedule-management-service"].root == project.resolve()
+
+
+def test_cli_config_add_project_accepts_path_and_id_override(tmp_path, capsys):
+    project = tmp_path / "service-directory"
+    project.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('operator_id = "ian"\n')
+
+    assert run([
+        "--config", str(config_path), "config", "add-project", str(project), "--id", "schedule-service"
+    ]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["project_id"] == "schedule-service"
+    assert load_app_config(config_path).projects["schedule-service"].root == project.resolve()
+
+
+def test_cli_capture_latest_extracts_newest_registered_project_session_and_indexes_it(
+    tmp_path, capsys, monkeypatch
+):
+    project_root = tmp_path / "lvcore"
+    project_root.mkdir()
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project_root.resolve()))
+    transcript_dir.mkdir(parents=True)
+    older = transcript_dir / "older.jsonl"
+    latest = transcript_dir / "latest.jsonl"
+    older.write_text('{"type":"user","message":{"content":"old"}}\n')
+    latest.write_text('{"type":"user","message":{"content":"rabbitmq latest"}}\n')
+    older.touch()
+    latest.touch()
+    older_mtime = latest.stat().st_mtime - 10
+    import os
+
+    os.utime(older, (older_mtime, older_mtime))
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{artifacts}"\n'
+        f'database = "{database}"\n'
+        'operator_id = "ian"\n'
+        '[projects.lvcore]\n'
+        f'root = "{project_root}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.chdir(project_root)
+    record = make_record(
+        question="What was learned?",
+        summary="RabbitMQ latest session evidence.",
+        source=str(latest.resolve()),
+        source_session_id="latest",
+        project=ProjectProvenance(project_id="lvcore", project_root=str(project_root)),
+    )
+    extractor = FakeExtractor([record], project_id="lvcore")
+
+    assert run(["--config", str(config_path), "capture", "--latest"], KeywordEmbedder(), extractor) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert extractor.last_transcript == latest
+    assert result == {
+        "status": "activated",
+        "session_id": "latest",
+        "records": 1,
+        "indexed": 1,
+        "exact_duplicates": 0,
+        "possible_duplicates": 0,
+    }
+    assert run(["--config", str(config_path), "search", "rabbitmq", "--project-id", "lvcore"], KeywordEmbedder()) == 0
+    assert "RabbitMQ latest session evidence" in capsys.readouterr().out
+
+
+def test_cli_capture_rejects_project_not_registered_in_config(tmp_path, capsys, monkeypatch):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n'
+        'operator_id = "ian"\n'
+        '[projects.lvcore]\n'
+        f'root = "{tmp_path / "lvcore"}"\n'
+    )
+    monkeypatch.setenv("SESSION_RAG_PROJECT_ID", "session-rag")
+    monkeypatch.setenv("SESSION_RAG_PROJECT_ROOT", str(tmp_path / "session-rag"))
+    extractor = FakeExtractor([], project_id="session-rag")
+
+    assert run(["--config", str(config_path), "capture", "--latest"], KeywordEmbedder(), extractor) == 3
+
+    assert extractor.calls == 0
+    assert "is not registered in the config" in capsys.readouterr().err
+
+
+def test_cli_capture_latest_is_no_op_for_unchanged_active_session(tmp_path, capsys, monkeypatch):
+    project_root = tmp_path / "lvcore"
+    project_root.mkdir()
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project_root.resolve()))
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "session-1.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"knowledge"}}\n')
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'artifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n'
+        'operator_id = "ian"\n'
+        '[projects.lvcore]\n'
+        f'root = "{project_root}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.chdir(project_root)
+    record = make_record(
+        source=str(transcript.resolve()),
+        source_session_id="session-1",
+        project=ProjectProvenance(project_id="lvcore", project_root=str(project_root)),
+    )
+    extractor = FakeExtractor([record], project_id="lvcore")
+
+    assert run(["--config", str(config_path), "capture", "--latest"], KeywordEmbedder(), extractor) == 0
+    capsys.readouterr()
+    assert run(["--config", str(config_path), "capture", "--latest"], KeywordEmbedder(), extractor) == 0
+
+    assert extractor.calls == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "no_op"
 
 
 def test_user_prompt_hook_returns_additional_context(tmp_path):
@@ -1294,3 +1521,384 @@ def test_forget_requires_exactly_one_of_source_id_or_project(tmp_path):
     exit_code = run(["forget", "--artifacts", str(artifacts_dir), "--database", str(database)])
 
     assert exit_code == 1
+
+
+def test_import_sessions_dry_run_discovers_all_configured_claude_projects(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    claude_home = tmp_path / ".claude"
+    project_a = tmp_path / "a"
+    project_b = tmp_path / "b"
+    for project, session_id in ((project_a, "one"), (project_b, "two")):
+        transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+        transcript_dir.mkdir(parents=True)
+        (transcript_dir / f"{session_id}.jsonl").write_text('{"type":"user","message":{"content":"hello"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{database}"\n'
+        f'[projects.a]\nroot = "{project_a}"\n[projects.b]\nroot = "{project_b}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--all-projects", "--dry-run"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["discovered"] == 2
+
+
+def test_import_sessions_project_filter_and_resume_are_safe(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    claude_home = tmp_path / ".claude"
+    project = tmp_path / "lvcore"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "one.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"hello"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{database}"\n'
+        f'[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    record = make_record(source=str(transcript), source_session_id="one", project=ProjectProvenance(project_id="lvcore"))
+    fake = FakeExtractor([record], project_id="lvcore")
+
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--project", "lvcore"], KeywordEmbedder(), fake) == 0
+    assert fake.calls == 1
+    capsys.readouterr()
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--project", "lvcore", "--resume"], KeywordEmbedder(), fake) == 0
+    assert fake.calls == 1
+    assert json.loads(capsys.readouterr().out)["eligible"] == 0
+
+
+def test_import_sessions_cursor_uses_only_local_rows_and_keeps_them_unscoped(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "memory.lance"
+    cursor_db = tmp_path / "conversation-search.db"
+    with sqlite3.connect(cursor_db) as connection:
+        connection.execute("CREATE TABLE conversations (fts_rowid INTEGER PRIMARY KEY, id TEXT, title TEXT, source TEXT, updated_at REAL)")
+        connection.execute("CREATE TABLE conversation_fts (title TEXT, body TEXT)")
+        connection.executemany(
+            "INSERT INTO conversations VALUES (?, ?, ?, ?, ?)",
+            [(1, "local-one", "Local", "local", 1), (2, "cloud-copy", "Cloud", "cloud-cache", 2)],
+        )
+        connection.executemany(
+            "INSERT INTO conversation_fts VALUES (?, ?)",
+            [("Local", "local conversation"), ("Cloud", "duplicated cloud conversation")],
+        )
+    config = tmp_path / "config.toml"
+    config.write_text(f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{database}"\n')
+
+    assert run(["--config", str(config), "import-sessions", "--source", "cursor", "--cursor-database", str(cursor_db), "--dry-run"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["discovered"] == 1
+    assert not (artifacts / ".source-snapshots").exists()
+
+
+def test_import_sessions_rejects_project_filter_for_cursor(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{tmp_path / "artifacts"}"\ndatabase = "{tmp_path / "database"}"\n'
+        f'[projects.lvcore]\nroot = "{tmp_path / "lvcore"}"\n'
+    )
+
+    assert run(["--config", str(config), "import-sessions", "--source", "cursor", "--project", "lvcore"]) == 3
+    assert "project selection applies only to Claude sessions" in capsys.readouterr().err
+
+
+def test_import_sessions_requires_explicit_claude_project_scope(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n'
+    )
+
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--dry-run"]) == 3
+    assert "requires --project ID, --project current, or --all-projects" in capsys.readouterr().err
+
+
+def test_import_sessions_project_current_uses_project_matched_from_cwd(tmp_path, capsys, monkeypatch):
+    project = tmp_path / "lvcore"
+    project.mkdir()
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "one.jsonl").write_text('{"type":"user","message":{"content":"hello"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.chdir(project)
+
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--project", "current", "--dry-run"]) == 0
+    assert json.loads(capsys.readouterr().out)["discovered"] == 1
+
+
+def test_import_sessions_resume_does_not_silently_process_a_changed_revision(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    claude_home = tmp_path / ".claude"
+    project = tmp_path / "lvcore"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "one.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"first"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{tmp_path / "database"}"\n'
+        f'[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    failed = FakeExtractor(error=ExtractionPendingRetry("quota"), project_id="lvcore")
+    run(["--config", str(config), "import-sessions", "--project", "lvcore"], KeywordEmbedder(), failed)
+    transcript.write_text('{"type":"user","message":{"content":"changed"}}\n')
+    capsys.readouterr()
+
+    assert run(["--config", str(config), "import-sessions", "--project", "lvcore", "--resume"], KeywordEmbedder(), failed) == 0
+    assert failed.calls == 1
+    assert json.loads(capsys.readouterr().out)["changed_since_failure"] == 1
+
+
+def test_ingest_skips_exact_normalized_duplicates_and_preserves_duplicate_link(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    project = ProjectProvenance(project_id="lvcore")
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first.write_text('{"type":"user","message":{"content":"first"}}\n')
+    second.write_text('{"type":"user","message":{"content":"second"}}\n')
+    shared = dict(
+        question="Where are the LVCore logs?",
+        summary="  They are in CLOUDWATCH. ",
+        resolution="Use the camerarelay log group.",
+        project=project,
+    )
+    run(["extract-session", str(first), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+        make_record(**shared, source=str(first), source_session_id="first")
+    ]))
+    run(["extract-session", str(second), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+        make_record(**{**shared, "summary": "they are in cloudwatch."}, source=str(second), source_session_id="second")
+    ]))
+    records = load_active_episode_records(artifacts)
+    first_id = next(record["id"] for record in records if record["source_id"] == "first")
+    second_id = next(record["id"] for record in records if record["source_id"] == "second")
+    capsys.readouterr()
+
+    assert run(["ingest", "--artifacts", str(artifacts), "--database", str(database)], KeywordEmbedder()) == 0
+    assert "Indexed 1 episode records" in capsys.readouterr().out
+    run(["history", second_id, "--artifacts", str(artifacts)])
+    state = json.loads(capsys.readouterr().out)
+    assert state["duplicate_of"] == first_id
+    assert state["duplicate_review_status"] == "exact"
+    run(["duplicates", "--project-id", "lvcore", "--artifacts", str(artifacts)])
+    assert json.loads(capsys.readouterr().out) == []
+
+
+def test_ingest_flags_semantic_matches_for_review_without_removing_them(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    project = ProjectProvenance(project_id="lvcore")
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    first.write_text('{"type":"user","message":{"content":"first"}}\n')
+    second.write_text('{"type":"user","message":{"content":"second"}}\n')
+    run(["extract-session", str(first), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+        make_record(question="Why did RabbitMQ reconnect?", summary="A heartbeat timeout caused it.", source=str(first), source_session_id="first", project=project)
+    ]))
+    run(["extract-session", str(second), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+        make_record(question="What caused the RabbitMQ connection reset?", summary="The broker missed its heartbeat.", source=str(second), source_session_id="second", project=project)
+    ]))
+    records = load_active_episode_records(artifacts)
+    first_id = next(record["id"] for record in records if record["source_id"] == "first")
+    second_id = next(record["id"] for record in records if record["source_id"] == "second")
+    capsys.readouterr()
+
+    run(["ingest", "--artifacts", str(artifacts), "--database", str(database)], KeywordEmbedder())
+    assert "Indexed 2 episode records" in capsys.readouterr().out
+    run(["history", second_id, "--artifacts", str(artifacts)])
+    state = json.loads(capsys.readouterr().out)
+    assert state["duplicate_of"] is None
+    assert state["duplicate_review_status"] == "possible"
+    assert state["reinforces"][0]["record_id"] == first_id
+    run(["duplicates", "--project-id", "lvcore", "--artifacts", str(artifacts)])
+    queue = json.loads(capsys.readouterr().out)
+    assert [item["record_id"] for item in queue] == [second_id]
+
+
+def test_ingest_never_deduplicates_identical_episodes_across_projects(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    for name, project_id in (("first", "lvcore"), ("second", "beacon")):
+        transcript = tmp_path / f"{name}.jsonl"
+        transcript.write_text('{"type":"user","message":{"content":"same"}}\n')
+        run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+            make_record(question="Where are logs?", summary="CloudWatch", source=str(transcript), source_session_id=name, project=ProjectProvenance(project_id=project_id))
+        ]))
+    capsys.readouterr()
+
+    run(["ingest", "--artifacts", str(artifacts), "--database", str(database)], KeywordEmbedder())
+
+    assert "Indexed 2 episode records" in capsys.readouterr().out
+
+
+def test_ingest_does_not_compare_records_without_trusted_project_provenance(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    for name in ("first", "second"):
+        transcript = tmp_path / f"{name}.jsonl"
+        transcript.write_text('{"type":"user","message":{"content":"same"}}\n')
+        run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+            make_record(question="Where are logs?", summary="CloudWatch", source=str(transcript), source_session_id=name)
+        ]))
+    capsys.readouterr()
+
+    run(["ingest", "--artifacts", str(artifacts), "--database", str(database)], KeywordEmbedder())
+
+    assert "Indexed 2 episode records" in capsys.readouterr().out
+
+
+def test_health_check_writes_deterministic_review_report_without_changing_record_state(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    transcript = tmp_path / "old.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"old behavior"}}\n')
+    record = make_record(
+        question="How did the old deploy work?",
+        summary="It copied jars directly.",
+        timestamp="2020-01-01T00:00:00Z",
+        temporal_scope="time_sensitive",
+        evidence_location=None,
+        source=str(transcript),
+        source_session_id="old",
+        project=ProjectProvenance(project_id="lvcore"),
+    )
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([record]))
+    record_id = load_active_episode_records(artifacts)[0]["id"]
+    capsys.readouterr()
+
+    assert run(["health-check", "--project-id", "lvcore", "--artifacts", str(artifacts)]) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    categories = {finding["category"] for finding in result["findings"]}
+    assert {"stale_record", "unsupported_claim"} <= categories
+    assert Path(result["report_path"]).exists()
+    assert read_state(artifacts, record_id)["verification_status"] == "unreviewed"
+
+
+def test_health_check_accepts_grounded_cursor_findings_and_rejects_forged_record_links(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"deployment"}}\n')
+    record = make_record(
+        question="How is deployment performed?",
+        summary="The build uploads dependencies.",
+        source=str(transcript),
+        source_session_id="session",
+        project=ProjectProvenance(project_id="lvcore"),
+    )
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([record]))
+    record_id = load_active_episode_records(artifacts)[0]["id"]
+    checker = FakeHealthChecker([
+        {
+            "category": "contradiction",
+            "title": "Deployment descriptions disagree",
+            "explanation": "Review current deployment behavior.",
+            "record_ids": [record_id],
+            "recommended_action": "Verify against the repository.",
+        },
+        {
+            "category": "suggested_article",
+            "title": "Forged source",
+            "explanation": "Bad link.",
+            "record_ids": ["invented-record"],
+            "recommended_action": "Do not keep this link.",
+        },
+    ])
+    capsys.readouterr()
+
+    assert run(["health-check", "--project-id", "lvcore", "--ai", "--artifacts", str(artifacts)], health_checker=checker) == 0
+
+    result = json.loads(capsys.readouterr().out)
+    assert checker.calls == 1
+    contradictions = [finding for finding in result["findings"] if finding["category"] == "contradiction"]
+    assert len(contradictions) == 1
+    assert contradictions[0]["record_ids"] == [record_id]
+    assert all("invented-record" not in finding["record_ids"] for finding in result["findings"])
+
+
+def test_health_check_reports_unprocessed_sessions_and_project_scoped_empty_retrievals(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    database = tmp_path / "database"
+    project = tmp_path / "lvcore"
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "never-imported.jsonl").write_text('{"type":"user","message":{"content":"new"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\ndatabase = "{database}"\n'
+        f'[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    run(["--config", str(config), "search", "nothing", "--project-id", "lvcore"], KeywordEmbedder())
+    capsys.readouterr()
+
+    run(["--config", str(config), "health-check", "--project-id", "lvcore"])
+
+    categories = {finding["category"] for finding in json.loads(capsys.readouterr().out)["findings"]}
+    assert {"unprocessed_source", "weak_retrieval"} <= categories
+
+
+def test_health_check_report_path_cannot_escape_through_project_id(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+
+    run(["health-check", "--project-id", "../../outside", "--artifacts", str(artifacts)])
+
+    report = Path(json.loads(capsys.readouterr().out)["report_path"])
+    assert report.is_relative_to(artifacts / "health-checks")
+    assert ".." not in report.relative_to(artifacts / "health-checks").parts
+
+
+def test_health_check_locally_flags_same_question_with_conflicting_answers(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    for name, answer in (("old", "Deploy with Ant."), ("new", "Deploy with Gradle.")):
+        transcript = tmp_path / f"{name}.jsonl"
+        transcript.write_text('{"type":"user","message":{"content":"deploy"}}\n')
+        run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([
+            make_record(
+                question="How do we deploy LVCore?", summary=answer, source=str(transcript),
+                source_session_id=name, project=ProjectProvenance(project_id="lvcore"),
+            )
+        ]))
+    capsys.readouterr()
+
+    run(["health-check", "--project-id", "lvcore", "--artifacts", str(artifacts)])
+
+    findings = json.loads(capsys.readouterr().out)["findings"]
+    assert any(finding["category"] == "possible_contradiction" for finding in findings)
+
+
+def test_health_check_treats_a_changed_session_revision_as_unprocessed(tmp_path, capsys, monkeypatch):
+    artifacts = tmp_path / "artifacts"
+    project = tmp_path / "lvcore"
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    transcript = transcript_dir / "session.jsonl"
+    transcript.write_text('{"type":"user","message":{"content":"old"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{artifacts}"\n'
+        f'[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    record = make_record(source=str(transcript), source_session_id="session", project=ProjectProvenance(project_id="lvcore"))
+    run(["extract-session", str(transcript), "--artifacts", str(artifacts)], extractor=FakeExtractor([record]))
+    transcript.write_text('{"type":"user","message":{"content":"new revision"}}\n')
+    capsys.readouterr()
+
+    run(["--config", str(config), "health-check", "--project-id", "lvcore"])
+
+    findings = json.loads(capsys.readouterr().out)["findings"]
+    assert any(finding["category"] == "unprocessed_source" for finding in findings)
