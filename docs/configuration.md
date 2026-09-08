@@ -29,6 +29,24 @@ root = "/Users/ian.handley/src/work/lvcore"
 knowledge_base = "/Users/ian.handley/src/personal/second-brain/lvcore_kb/Wiki"
 ```
 
+Register the Git repository containing the current directory without editing
+the TOML file manually:
+
+```sh
+memory config add-project
+```
+
+Pass a path to register another project. Its directory name becomes the ID
+unless `--id` overrides it:
+
+```sh
+memory config add-project ~/src/work/lvcore
+memory config add-project ~/src/work/schedule-management-service --id schedule-service
+```
+
+Registration is idempotent for the same ID and root. Conflicting IDs or roots
+are rejected rather than silently changing existing provenance.
+
 When the current directory is inside a configured project root, Memory
 selects the most specific matching project. Prompt text can never select or
 widen this Retrieval Scope.

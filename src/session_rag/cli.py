@@ -9,7 +9,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .app_config import ConfigError, ResolvedAppConfig, load_app_config, resolve_app_config
+from .app_config import ConfigError, ResolvedAppConfig, add_project, default_config_path, load_app_config, resolve_app_config
 from .artifacts import artifact_path, find_record, find_sources_by_project, forget_source, job_failures_for_project, load_active_episode_records, source_hash
 from .embeddings import FastEmbedder
 from .deduplication import DEFAULT_SEMANTIC_DUPLICATE_THRESHOLD, reconcile_duplicates
@@ -133,6 +133,9 @@ def parser() -> argparse.ArgumentParser:
     config_commands = config_cmd.add_subparsers(dest="config_command", required=True)
     config_commands.add_parser("show")
     config_commands.add_parser("current")
+    add_project_command = config_commands.add_parser("add-project")
+    add_project_command.add_argument("path", type=Path, nargs="?", default=Path.cwd())
+    add_project_command.add_argument("--id", dest="project_id")
     return result
 
 
@@ -267,6 +270,20 @@ def run(
         return 3
 
     if args.command == "config":
+        if args.config_command == "add-project":
+            config_path = app_config.path or default_config_path()
+            try:
+                project_id, root, added = add_project(config_path, args.path, args.project_id)
+            except ConfigError as error:
+                print(f"configuration error: {error}", file=sys.stderr)
+                return 3
+            print(json.dumps({
+                "status": "added" if added else "already_registered",
+                "project_id": project_id,
+                "root": str(root),
+                "config_path": str(config_path),
+            }, indent=2))
+            return 0
         display = (
             _global_config_display(app_config, resolved)
             if args.config_command == "show"

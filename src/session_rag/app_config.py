@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import json
+import re
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,6 +14,9 @@ from .envconfig import ENV_PREFIX, LEGACY_ENV_PREFIX
 
 class ConfigError(ValueError):
     """The application configuration exists but is invalid."""
+
+
+PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 @dataclass(frozen=True)
@@ -154,6 +160,44 @@ def load_app_config(path: Path | None = None, *, environ: Mapping[str, str] | No
         extractor=extractor,
         projects=projects,
     )
+
+
+def _nearest_project_root(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_dir():
+        raise ConfigError(f"project path is not a directory: {resolved}")
+    return next((candidate for candidate in (resolved, *resolved.parents) if (candidate / ".git").exists()), resolved)
+
+
+def add_project(config_path: Path, path: Path, project_id: str | None = None) -> tuple[str, Path, bool]:
+    """Append a project to the global TOML config without rewriting existing content."""
+    root = _nearest_project_root(path)
+    identifier = project_id or root.name
+    if not PROJECT_ID_PATTERN.fullmatch(identifier):
+        raise ConfigError("project ID must use only letters, numbers, dots, underscores, or hyphens")
+
+    existing = load_app_config(config_path) if config_path.exists() else AppConfig()
+    if identifier in existing.projects:
+        registered_root = existing.projects[identifier].root.expanduser().resolve()
+        if registered_root == root:
+            return identifier, root, False
+        raise ConfigError(f"project {identifier!r} is already registered with root {registered_root}")
+    for registered_id, project in existing.projects.items():
+        if project.root.expanduser().resolve() == root:
+            raise ConfigError(f"project root {root} is already registered as {registered_id!r}")
+
+    config_path = config_path.expanduser()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    current = config_path.read_text() if config_path.exists() else ""
+    separator = "" if not current else ("\n" if current.endswith("\n") else "\n\n")
+    addition = f'{separator}[projects.{json.dumps(identifier)}]\nroot = {json.dumps(str(root))}\n'
+    with tempfile.NamedTemporaryFile("w", dir=config_path.parent, delete=False) as temporary:
+        temporary.write(current + addition)
+        temporary_path = Path(temporary.name)
+    if config_path.exists():
+        temporary_path.chmod(config_path.stat().st_mode)
+    temporary_path.replace(config_path)
+    return identifier, root, True
 
 
 def _project_for_cwd(config: AppConfig, cwd: Path) -> tuple[str | None, ProjectSettings | None]:

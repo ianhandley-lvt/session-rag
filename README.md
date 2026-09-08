@@ -107,6 +107,24 @@ knowledge_base = "/Users/you/knowledge/another-project/Wiki"
 Use any stable name for each project table, such as `lvcore`. `root` is the
 local repository directory. `knowledge_base` is optional.
 
+You can register projects without editing TOML by hand. From anywhere inside a
+Git repository, this finds its root and uses the directory name as the project
+ID:
+
+```sh
+memory config add-project
+```
+
+Register a specific directory, or override its inferred ID:
+
+```sh
+memory config add-project ~/src/work/lvcore
+memory config add-project ~/src/work/schedule-management-service --id schedule-service
+```
+
+The command preserves the existing config file, refuses conflicting IDs or
+roots, and reports `already_registered` when the same project is added again.
+
 Create the storage directories and inspect the single global configuration:
 
 ```sh
@@ -286,6 +304,8 @@ unscoped Cursor conversations.
 | --- | --- |
 | Show the global configuration and all projects | `memory config show` |
 | Show the project resolved for this directory | `memory config current` |
+| Register the current project | `memory config add-project` |
+| Register another project | `memory config add-project PATH [--id ID]` |
 | Preview all configured Claude sessions | `memory import-sessions --source claude --all-projects --dry-run` |
 | Import one project's Claude sessions | `memory import-sessions --source claude --project ID` |
 | Import the current project's Claude sessions | `memory import-sessions --source claude --project current` |

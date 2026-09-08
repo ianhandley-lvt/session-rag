@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from session_rag.artifacts import artifact_path, find_record, job_status_path, load_active_episode_records, read_active_hash
+from session_rag.app_config import load_app_config
 from session_rag.cli import run
 from session_rag.extractors.base import (
     EvidenceLocation,
@@ -161,6 +162,42 @@ def test_cli_config_current_reports_project_for_current_directory(tmp_path, caps
 
     shown = json.loads(capsys.readouterr().out)
     assert shown["project"] == {"id": "lvcore", "root": str(project_root), "knowledge_base": None}
+
+
+def test_cli_config_add_project_defaults_to_current_git_root(tmp_path, capsys, monkeypatch):
+    xdg_home = tmp_path / "xdg"
+    project = tmp_path / "schedule-management-service"
+    nested = project / "src"
+    nested.mkdir(parents=True)
+    (project / ".git").mkdir()
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_home))
+    monkeypatch.delenv("MEMORY_CONFIG", raising=False)
+    monkeypatch.delenv("SESSION_RAG_CONFIG", raising=False)
+    monkeypatch.chdir(nested)
+
+    assert run(["config", "add-project"]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "added"
+    assert output["project_id"] == "schedule-management-service"
+    assert output["root"] == str(project.resolve())
+    config = load_app_config(xdg_home / "memory" / "config.toml")
+    assert config.projects["schedule-management-service"].root == project.resolve()
+
+
+def test_cli_config_add_project_accepts_path_and_id_override(tmp_path, capsys):
+    project = tmp_path / "service-directory"
+    project.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('operator_id = "ian"\n')
+
+    assert run([
+        "--config", str(config_path), "config", "add-project", str(project), "--id", "schedule-service"
+    ]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["project_id"] == "schedule-service"
+    assert load_app_config(config_path).projects["schedule-service"].root == project.resolve()
 
 
 def test_cli_capture_latest_extracts_newest_registered_project_session_and_indexes_it(

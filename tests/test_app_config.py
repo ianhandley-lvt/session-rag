@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from session_rag.app_config import ConfigError, load_app_config, resolve_app_config
+from session_rag.app_config import ConfigError, add_project, load_app_config, resolve_app_config
 
 
 def write_config(path: Path) -> None:
@@ -150,3 +150,41 @@ def test_explicit_values_override_environment_and_config(tmp_path):
     assert resolved.project_root == Path("/cli/project")
     assert resolved.cursor_model == "cli-model"
     assert resolved.max_sanitized_chars == 777
+
+
+def test_add_project_appends_without_rewriting_existing_config(tmp_path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('# keep this comment\noperator_id = "ian"\n')
+    project = tmp_path / "schedule-management-service"
+    project.mkdir()
+
+    identifier, root, added = add_project(config_path, project)
+
+    assert (identifier, root, added) == ("schedule-management-service", project.resolve(), True)
+    assert config_path.read_text().startswith('# keep this comment\noperator_id = "ian"\n')
+    assert load_app_config(config_path).projects[identifier].root == project.resolve()
+
+
+def test_add_project_uses_nearest_git_root_and_is_idempotent(tmp_path):
+    project = tmp_path / "repo"
+    nested = project / "src" / "feature"
+    nested.mkdir(parents=True)
+    (project / ".git").mkdir()
+    config_path = tmp_path / "config.toml"
+
+    assert add_project(config_path, nested) == ("repo", project.resolve(), True)
+    assert add_project(config_path, project) == ("repo", project.resolve(), False)
+
+
+def test_add_project_rejects_conflicting_id_or_root(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    config_path = tmp_path / "config.toml"
+    add_project(config_path, first, "service")
+
+    with pytest.raises(ConfigError, match="already registered with root"):
+        add_project(config_path, second, "service")
+    with pytest.raises(ConfigError, match="already registered as"):
+        add_project(config_path, first, "another-name")
