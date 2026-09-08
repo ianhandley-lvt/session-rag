@@ -122,7 +122,7 @@ def test_cli_uses_storage_paths_from_toml_config(tmp_path, capsys):
     assert "heartbeat timeout caused the reconnect" in output
 
 
-def test_cli_config_show_reports_effective_project_for_current_directory(tmp_path, capsys, monkeypatch):
+def test_cli_config_show_reports_global_config_and_all_registered_projects(tmp_path, capsys, monkeypatch):
     project_root = tmp_path / "lvcore"
     project_root.mkdir()
     config_path = tmp_path / "config.toml"
@@ -144,6 +144,22 @@ def test_cli_config_show_reports_effective_project_for_current_directory(tmp_pat
     shown = json.loads(capsys.readouterr().out)
     assert shown["operator_id"] == "ian"
     assert shown["extractor"]["max_sanitized_chars"] == 500000
+    assert shown["projects"] == {
+        "lvcore": {"root": str(project_root), "knowledge_base": None}
+    }
+    assert "project" not in shown
+
+
+def test_cli_config_current_reports_project_for_current_directory(tmp_path, capsys, monkeypatch):
+    project_root = tmp_path / "lvcore"
+    project_root.mkdir()
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(f'[projects.lvcore]\nroot = "{project_root}"\n')
+    monkeypatch.chdir(project_root)
+
+    assert run(["--config", str(config_path), "config", "current"]) == 0
+
+    shown = json.loads(capsys.readouterr().out)
     assert shown["project"] == {"id": "lvcore", "root": str(project_root), "knowledge_base": None}
 
 
@@ -1487,7 +1503,7 @@ def test_import_sessions_dry_run_discovers_all_configured_claude_projects(tmp_pa
     )
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
 
-    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--configured-projects", "--dry-run"]) == 0
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--all-projects", "--dry-run"]) == 0
 
     assert json.loads(capsys.readouterr().out)["discovered"] == 2
 
@@ -1543,15 +1559,45 @@ def test_import_sessions_cursor_uses_only_local_rows_and_keeps_them_unscoped(tmp
     assert not (artifacts / ".source-snapshots").exists()
 
 
-def test_import_sessions_rejects_project_filter_when_cursor_is_included(tmp_path, capsys):
+def test_import_sessions_rejects_project_filter_for_cursor(tmp_path, capsys):
     config = tmp_path / "config.toml"
     config.write_text(
         f'operator_id = "ian"\nartifacts = "{tmp_path / "artifacts"}"\ndatabase = "{tmp_path / "database"}"\n'
         f'[projects.lvcore]\nroot = "{tmp_path / "lvcore"}"\n'
     )
 
-    assert run(["--config", str(config), "import-sessions", "--source", "all", "--project", "lvcore"]) == 3
-    assert "cannot yet be assigned trusted project provenance" in capsys.readouterr().err
+    assert run(["--config", str(config), "import-sessions", "--source", "cursor", "--project", "lvcore"]) == 3
+    assert "project selection applies only to Claude sessions" in capsys.readouterr().err
+
+
+def test_import_sessions_requires_explicit_claude_project_scope(tmp_path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n'
+    )
+
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--dry-run"]) == 3
+    assert "requires --project ID, --project current, or --all-projects" in capsys.readouterr().err
+
+
+def test_import_sessions_project_current_uses_project_matched_from_cwd(tmp_path, capsys, monkeypatch):
+    project = tmp_path / "lvcore"
+    project.mkdir()
+    claude_home = tmp_path / ".claude"
+    transcript_dir = claude_home / "projects" / re.sub(r"[^A-Za-z0-9_-]", "-", str(project.resolve()))
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "one.jsonl").write_text('{"type":"user","message":{"content":"hello"}}\n')
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f'operator_id = "ian"\nartifacts = "{tmp_path / "artifacts"}"\n'
+        f'database = "{tmp_path / "database"}"\n[projects.lvcore]\nroot = "{project}"\n'
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.chdir(project)
+
+    assert run(["--config", str(config), "import-sessions", "--source", "claude", "--project", "current", "--dry-run"]) == 0
+    assert json.loads(capsys.readouterr().out)["discovered"] == 1
 
 
 def test_import_sessions_resume_does_not_silently_process_a_changed_revision(tmp_path, capsys, monkeypatch):

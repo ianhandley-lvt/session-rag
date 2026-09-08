@@ -121,10 +121,10 @@ def parser() -> argparse.ArgumentParser:
     capture.add_argument("--project-id")
     capture.add_argument("--project-root")
     batch = commands.add_parser("import-sessions")
-    batch.add_argument("--source", choices=["claude", "cursor", "all"], default="claude")
+    batch.add_argument("--source", choices=["claude", "cursor"], default="claude")
     project_selection = batch.add_mutually_exclusive_group()
     project_selection.add_argument("--project")
-    project_selection.add_argument("--configured-projects", action="store_true")
+    project_selection.add_argument("--all-projects", action="store_true")
     batch.add_argument("--dry-run", action="store_true")
     batch.add_argument("--since", help="Only sessions updated on/after YYYY-MM-DD")
     batch.add_argument("--resume", action="store_true", help="Retry only previously failed or blocked sessions")
@@ -132,6 +132,7 @@ def parser() -> argparse.ArgumentParser:
     config_cmd = commands.add_parser("config")
     config_commands = config_cmd.add_subparsers(dest="config_command", required=True)
     config_commands.add_parser("show")
+    config_commands.add_parser("current")
     return result
 
 
@@ -160,7 +161,7 @@ def _require(value, name: str):
     return value
 
 
-def _config_display(resolved: ResolvedAppConfig) -> dict:
+def _global_config_display(app_config, resolved: ResolvedAppConfig) -> dict:
     return {
         "config_path": str(resolved.config_path) if resolved.config_path else None,
         "operator_id": resolved.operator_id,
@@ -172,6 +173,19 @@ def _config_display(resolved: ResolvedAppConfig) -> dict:
             "model": resolved.cursor_model,
             "max_sanitized_chars": resolved.max_sanitized_chars,
         },
+        "projects": {
+            project_id: {
+                "root": str(project.root),
+                "knowledge_base": str(project.knowledge_base) if project.knowledge_base else None,
+            }
+            for project_id, project in app_config.projects.items()
+        },
+    }
+
+
+def _current_config_display(resolved: ResolvedAppConfig) -> dict:
+    return {
+        "config_path": str(resolved.config_path) if resolved.config_path else None,
         "project": {
             "id": resolved.project_id,
             "root": str(resolved.project_root) if resolved.project_root else None,
@@ -253,7 +267,12 @@ def run(
         return 3
 
     if args.command == "config":
-        print(json.dumps(_config_display(resolved), indent=2))
+        display = (
+            _global_config_display(app_config, resolved)
+            if args.config_command == "show"
+            else _current_config_display(resolved)
+        )
+        print(json.dumps(display, indent=2))
         return 0
 
     try:
@@ -318,23 +337,33 @@ def run(
             )
         )
     elif args.command == "import-sessions":
-        if args.project and args.source in {"cursor", "all"}:
-            print("configuration error: Cursor sessions cannot yet be assigned trusted project provenance", file=sys.stderr)
+        if args.source == "cursor" and (args.project or args.all_projects):
+            print("configuration error: project selection applies only to Claude sessions", file=sys.stderr)
             return 3
-        if args.project and args.project not in app_config.projects:
-            print(f"configuration error: project {args.project!r} is not registered", file=sys.stderr)
-            return 3
+        selected_project = args.project
+        if args.source == "claude":
+            if selected_project == "current":
+                selected_project = resolved.project_id
+                if selected_project is None:
+                    print("configuration error: current directory is not inside a registered project", file=sys.stderr)
+                    return 3
+            if not args.all_projects and selected_project is None:
+                print("configuration error: Claude import requires --project ID, --project current, or --all-projects", file=sys.stderr)
+                return 3
+            if selected_project and selected_project not in app_config.projects:
+                print(f"configuration error: project {selected_project!r} is not registered", file=sys.stderr)
+                return 3
         try:
             cutoff = parse_since(args.since)
         except ValueError:
             print("configuration error: --since must be an ISO date such as 2026-09-01", file=sys.stderr)
             return 3
         sources = []
-        if args.source in {"claude", "all"}:
+        if args.source == "claude":
             claude_home = Path(os.getenv("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
-            sources.extend(claude_sessions(app_config.projects, claude_home, args.project))
+            sources.extend(claude_sessions(app_config.projects, claude_home, selected_project))
         cursor_temporary = None
-        if args.source in {"cursor", "all"}:
+        if args.source == "cursor":
             cursor_db = args.cursor_database or Path.home() / "Library/Application Support/Cursor/User/globalStorage/conversation-search.db"
             # Normalized Cursor rows are transient extraction input. The
             # immutable artifact preserves cited evidence; retaining another

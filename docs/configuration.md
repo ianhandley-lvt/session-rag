@@ -33,10 +33,17 @@ When the current directory is inside a configured project root, Memory
 selects the most specific matching project. Prompt text can never select or
 widen this Retrieval Scope.
 
-Inspect the effective configuration for the current directory with:
+Inspect the single global configuration, including every registered project,
+with:
 
 ```sh
 memory config show
+```
+
+Inspect only the project resolved from the current directory with:
+
+```sh
+memory config current
 ```
 
 With storage paths configured, commands no longer need repeated `--artifacts`
@@ -60,11 +67,10 @@ memory capture --latest
 Preview first, then remove `--dry-run` to extract and index:
 
 ```sh
-memory import-sessions --source claude --configured-projects --dry-run
+memory import-sessions --source claude --all-projects --dry-run
 memory import-sessions --source claude --project lvcore --since 2026-09-01 --dry-run
+memory import-sessions --source claude --project current --dry-run
 memory import-sessions --source cursor --dry-run
-memory import-sessions --source all --dry-run
-memory import-sessions --source all --resume
 ```
 
 The batch continues past individual failures and rebuilds the index once at
@@ -73,6 +79,8 @@ sources are reported as `changed_since_failure` and require a fresh normal
 import. Cursor is read through a temporary, read-only database snapshot.
 Because its project fingerprint is opaque, Cursor conversations are imported
 without project provenance and require `--global-scope` during retrieval.
+Memory intentionally does not combine Claude and Cursor discovery under a
+`--source all` option because their scope and provenance rules differ.
 
 Each index rebuild automatically skips exact normalized duplicates inside the
 same project and flags probable semantic matches without removing them. Inspect

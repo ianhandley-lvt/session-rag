@@ -107,11 +107,18 @@ knowledge_base = "/Users/you/knowledge/another-project/Wiki"
 Use any stable name for each project table, such as `lvcore`. `root` is the
 local repository directory. `knowledge_base` is optional.
 
-Create the storage directories and verify the resolved configuration:
+Create the storage directories and inspect the single global configuration:
 
 ```sh
 mkdir -p ~/.local/share/memory/artifacts ~/.local/share/memory/lancedb
 memory config show
+```
+
+`config show` lists every registered project. To see which project Memory
+resolves from the directory you are currently in, run:
+
+```sh
+memory config current
 ```
 
 Configuration precedence is command option, `MEMORY_*` environment variable,
@@ -126,10 +133,10 @@ Extraction uses Cursor model quota. A dry run discovers candidates without
 calling the model:
 
 ```sh
-memory import-sessions --source claude --configured-projects --dry-run
+memory import-sessions --source claude --all-projects --dry-run
 memory import-sessions --source claude --project my-project --dry-run
+memory import-sessions --source claude --project current --dry-run
 memory import-sessions --source cursor --dry-run
-memory import-sessions --source all --dry-run
 ```
 
 ### Import Claude sessions
@@ -137,15 +144,21 @@ memory import-sessions --source all --dry-run
 Import every transcript belonging to configured projects:
 
 ```sh
-memory import-sessions --source claude --configured-projects
+memory import-sessions --source claude --all-projects
 ```
 
 Limit the import to one project or recent sessions:
 
 ```sh
 memory import-sessions --source claude --project my-project
+memory import-sessions --source claude --project current
 memory import-sessions --source claude --project my-project --since 2026-09-01
 ```
+
+Claude imports always require an explicit project scope. `--project current`
+uses the registered project containing the current directory; it fails clearly
+when the directory is not inside one. `--all-projects` imports every registered
+Claude project.
 
 To retry recorded extraction failures without retrying everything:
 
@@ -177,6 +190,10 @@ Memory reads a temporary, read-only snapshot of Cursor's local conversation
 search database and ignores duplicate cloud-cache rows. Cursor does not expose
 a trustworthy project path there, so these records are deliberately unscoped.
 They appear only in searches that explicitly use `--global-scope`.
+
+There is intentionally no `--source all` command. Claude imports are
+project-scoped while Cursor imports are global and unscoped, so combining them
+made discovery totals misleading. Run the two explicit commands separately.
 
 ### Import a curated Markdown knowledge base
 
@@ -267,12 +284,13 @@ unscoped Cursor conversations.
 
 | Goal | Command |
 | --- | --- |
-| Show effective configuration | `memory config show` |
-| Preview all configured Claude sessions | `memory import-sessions --source claude --configured-projects --dry-run` |
+| Show the global configuration and all projects | `memory config show` |
+| Show the project resolved for this directory | `memory config current` |
+| Preview all configured Claude sessions | `memory import-sessions --source claude --all-projects --dry-run` |
 | Import one project's Claude sessions | `memory import-sessions --source claude --project ID` |
+| Import the current project's Claude sessions | `memory import-sessions --source claude --project current` |
 | Capture the current project's newest session | `memory capture --latest` |
 | Preview/import Cursor | `memory import-sessions --source cursor --dry-run` / remove `--dry-run` |
-| Import all source adapters | `memory import-sessions --source all` |
 | Retry unchanged failed revisions | `memory import-sessions --source claude --project ID --resume` |
 | Rebuild the derived index | `memory ingest` |
 | Search one project | `memory search "question" --project-id ID` |
@@ -340,8 +358,9 @@ Ensure `~/.local/bin` is on `PATH`, then rerun `uv tool install --editable .`.
 
 **No Claude sessions are discovered**
 
-Confirm the project `root` exactly matches the path used when Claude Code ran,
-and inspect it with `memory config show` from inside that project.
+Confirm the project `root` exactly matches the path used when Claude Code ran.
+Use `memory config show` to inspect all registered roots and `memory config
+current` from inside the project to confirm that it resolves correctly.
 
 **Extraction is blocked because the session is too large**
 
